@@ -1,26 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════════════╗
-║   NSE FUTURES  ·  Pure Price Action  ·  N-Bar Donchian              ║
-║   WALK-FORWARD:  7-Year Train  →  1-Year Live Execution             ║
-║   Zero Indicators  ·  Full NSE Charges  ·  Monte Carlo              ║
-╚══════════════════════════════════════════════════════════════════════╝
-
-METHODOLOGY:
-  Phase 1 — TRAINING  (Year 1–7, never traded)
-    → Test N_BAR = [10,15,20,30,40,55,80] on 7yr data
-    → Score each N_BAR on: Profit Factor × Sharpe (composite)
-    → Pick the N_BAR with MOST CONSISTENT score across sub-periods
-    → Lock it. Never touch again.
-
-  Phase 2 — LIVE EXECUTION  (Year 8 only)
-    → Run locked N_BAR on the unseen 1yr window
-    → This is the ONLY number you report to anyone
-
-  Why this matters:
-    If you tune N_BAR on 8yr then backtest on 8yr → you are
-    fitting to noise. Year-8 results will be an illusion.
-    Locking Year 8 before tuning ensures it is genuinely unseen.
-"""
 
 # ── stdlib ────────────────────────────────────────────────────────────
 import datetime as dt
