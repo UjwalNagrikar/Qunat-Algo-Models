@@ -1,1 +1,0 @@
-# Quant-Finance-Trading-Model-Alorithem-Businees
