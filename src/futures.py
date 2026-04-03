@@ -598,7 +598,7 @@ for rsn, cnt in sorted(xrsn_cnt.items(), key=lambda x:-x[1]):
     print(f"    {rsn:<8}  {cnt:>4} trades   WR {ww/cnt*100:.0f}%")
 print(f"{'═'*64}\n")
 
-# Plting 
+# Ploting A result summary plot (equity curve + drawdown)
 
 print(f"\n[OK]  Complete.  {len(pnls_live)} trades  |  "
       f"{len(rolls_live)} rollovers  |  {margin_calls} margin calls\n")
