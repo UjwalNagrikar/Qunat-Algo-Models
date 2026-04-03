@@ -53,7 +53,7 @@ GST_RATE   = 0.18
 
 OUT_DIR    = "outputs"   # Local outputs directory
 IST        = pytz.timezone("Asia/Kolkata")
-SAVE_PLOTS = False  # Set True to save PNG files
+SAVE_PLOTS = True  # Set True to save PNG files
 
 # ═══════════════════════════════════════════════════════════════════════
 # 3.  NSE EXPIRY CALENDAR
@@ -132,6 +132,15 @@ def build_donchian(df: pd.DataFrame, n: int) -> pd.DataFrame:
     out["short_sig"] = df["c"] < out["dc_low"]
     out.dropna(inplace=True)
     return out
+
+
+def calc_drawdown(equity: pd.Series):
+    """Return drawdown series, max drawdown fraction, peak and trough dates."""
+    peak = equity.cummax()
+    dd = (equity - peak) / peak
+    trough = dd.idxmin()
+    peak_date = equity.loc[:trough].idxmax()
+    return dd, dd.min(), peak_date, trough
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -461,6 +470,10 @@ df_exec   = df_seeded.loc[df_seeded.index >= split_date].copy()
 rets_l   = eq_live.pct_change().dropna()
 dd_live  = (eq_live / eq_live.cummax() - 1) * 100
 
+fin_dd, fin_dd_frac, fin_dd_peak, fin_dd_trough = calc_drawdown(eq_live)
+print(f"\n[INFO] (Futures) Equity bars: {len(eq_live)}, max drawdown = {fin_dd_frac*100:.2f}%")
+print(f"[INFO] (Futures) Drawdown peak→trough: {fin_dd_peak.date()} → {fin_dd_trough.date()}")
+
 tot_ret  = (eq_live.iloc[-1] / INITIAL_CAPITAL - 1) * 100
 max_dd   = dd_live.min()
 wins_l   = [p for p in pnls_live if p > 0]
@@ -742,12 +755,15 @@ fig.text(0.97, 0.01,
          "Hypothetical backtest — uses spot price as futures proxy. Not financial advice.",
          fontsize=7, color=DIM, ha="right", style="italic")
 
-if SAVE_PLOTS:
-    out1 = f"outputs/FUTURES_LIVE_{sym}_donchian{BEST_N}.png"
-    fig.savefig(out1, dpi=150, bbox_inches="tight", facecolor=BG)
-    print(f"[OK]  Chart saved  →  {out1}")
-else:
-    plt.show()
+# ALWAYS save
+out1 = f"outputs/FUTURES_LIVE_{sym}_donchian{BEST_N}.png"
+fig.savefig(out1, dpi=150, bbox_inches="tight", facecolor=BG)
+
+print(f"[OK] Chart saved → {out1}")
+
+# ALSO display in Colab
+from IPython.display import Image, display
+display(Image(out1))
 
 plt.close(fig)
 
