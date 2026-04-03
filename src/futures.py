@@ -2,7 +2,6 @@
 import datetime as dt
 import os, sys, warnings
 warnings.filterwarnings("ignore")
-
 import pytz, yfinance as yf
 import numpy as np
 import pandas as pd
@@ -17,29 +16,6 @@ import matplotlib.ticker as mticker
 # ═══════════════════════════════════════════════════════════════════════
 DB = {
     "RELIANCE.NS" : (250,  150_000, "Reliance Industries"),
-    "TCS.NS"      : (150,  175_000, "Tata Consultancy"),
-    "HDFCBANK.NS" : (550,  100_000, "HDFC Bank"),
-    "INFY.NS"     : (400,  100_000, "Infosys"),
-    "ICICIBANK.NS": (700,   90_000, "ICICI Bank"),
-    "SBIN.NS"     : (1500,  80_000, "SBI"),
-    "AXISBANK.NS" : (625,   90_000, "Axis Bank"),
-    "KOTAKBANK.NS": (400,  130_000, "Kotak Bank"),
-    "LT.NS"       : (175,  200_000, "L&T"),
-    "TATAMOTORS.NS":(1425,  75_000, "Tata Motors"),
-    "TATASTEEL.NS": (5500,  50_000, "Tata Steel"),
-    "MARUTI.NS"   : (100,  160_000, "Maruti Suzuki"),
-    "WIPRO.NS"    : (1500,  65_000, "Wipro"),
-    "BHARTIARTL.NS":(475,  115_000, "Bharti Airtel"),
-    "BAJFINANCE.NS":(125,  180_000, "Bajaj Finance"),
-    "SUNPHARMA.NS": (700,   95_000, "Sun Pharma"),
-    "HCLTECH.NS"  : (700,   85_000, "HCL Tech"),
-    "ONGC.NS"     : (3850,  45_000, "ONGC"),
-    "NTPC.NS"     : (3000,  42_000, "NTPC"),
-    "JSWSTEEL.NS" : (1350,  75_000, "JSW Steel"),
-    "M&M.NS"      : (700,   90_000, "M&M"),
-    "ADANIENT.NS" : (125,  200_000, "Adani Enterprises"),
-    "^NSEI"       : (75,   130_000, "NIFTY 50"),
-    "^NSEBANK"    : (15,   125_000, "BANKNIFTY"),
 }
 
 # ═══════════════════════════════════════════════════════════════════════
