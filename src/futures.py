@@ -1,17 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════════════╗
-║   NSE STOCK FUTURES  ·  Pure Price Action                           ║
-║   N-Bar Donchian Breakout  ·  FUTURES ONLY (No Options, No Spot)    ║
-║                                                                      ║
-║   FUTURES-SPECIFIC MECHANICS:                                        ║
-║   1. Monthly expiry  — last Thursday of every month (NSE)           ║
-║   2. Daily MTM       — P&L settled to margin account each day       ║
-║   3. Rollover        — position rolled 1 day before expiry          ║
-║   4. Rollover cost   — full entry+exit charges on roll              ║
-║   5. Margin call     — position force-closed if margin breached     ║
-║   6. Walk-Forward    — 7yr train → 1yr live execution               ║
-╚══════════════════════════════════════════════════════════════════════╝
-"""
 
 import datetime as dt
 import os, sys, warnings
@@ -89,8 +75,9 @@ SEBI_RATE  = 0.000001
 STAMP_RATE = 0.00002               # stamp on BUY side
 GST_RATE   = 0.18
 
-OUT_DIR    = "/mnt/user-data/outputs"   # Colab → "/content"
+OUT_DIR    = "outputs"   # Local outputs directory
 IST        = pytz.timezone("Asia/Kolkata")
+SAVE_PLOTS = False  # Set True to save PNG files
 
 # ═══════════════════════════════════════════════════════════════════════
 # 3.  NSE EXPIRY CALENDAR
@@ -626,7 +613,7 @@ print(f"{'═'*64}\n")
 # 12.  CHARTS
 # ═══════════════════════════════════════════════════════════════════════
 os.makedirs(OUT_DIR, exist_ok=True)
-sym = SYMBOL.replace(".NS","").replace("^","")
+sym = SYMBOL.replace(".NS"," ").replace("^","")
 
 BG   = "#07090f"; CARD = "#0d1120"; GRID = "#161d30"
 TXT  = "#dde3f0"; DIM  = "#4a5570"
@@ -779,9 +766,13 @@ fig.text(0.97, 0.01,
          "Hypothetical backtest — uses spot price as futures proxy. Not financial advice.",
          fontsize=7, color=DIM, ha="right", style="italic")
 
-out1 = f"{OUT_DIR}/FUTURES_LIVE_{sym}_donchian{BEST_N}.png"
-fig.savefig(out1, dpi=150, bbox_inches="tight", facecolor=BG)
-print(f"[OK]  Chart saved  →  {out1}")
+if SAVE_PLOTS:
+    out1 = f"outputs/FUTURES_LIVE_{sym}_donchian{BEST_N}.png"
+    fig.savefig(out1, dpi=150, bbox_inches="tight", facecolor=BG)
+    print(f"[OK]  Chart saved  →  {out1}")
+else:
+    plt.show()
+
 plt.close(fig)
 
 print(f"\n[OK]  Complete.  {len(pnls_live)} trades  |  "

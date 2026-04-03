@@ -32,7 +32,7 @@ import pytz, yfinance as yf
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.ticker as mticker
@@ -100,7 +100,7 @@ GST_RATE   = 0.18
 MC_RUNS    = 1_000
 MC_RUIN    = 0.50
 
-OUT_DIR    = "/mnt/user-data/outputs"   # Colab: "/content"
+SAVE_PLOTS = False  # Set True to save PNGs to outputs/
 IST        = pytz.timezone("Asia/Kolkata")
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -518,7 +518,7 @@ else:
 # ═══════════════════════════════════════════════════════════════════════
 # 12.  CHARTS
 # ═══════════════════════════════════════════════════════════════════════
-os.makedirs(OUT_DIR, exist_ok=True)
+
 sym  = SYMBOL.replace(".NS","").replace("^","")
 
 BG   = "#07090f"; CARD = "#0d1120"; GRID = "#161d30"
@@ -607,9 +607,12 @@ fig.text(0.97, 0.01,
          "Backtest results hypothetical. Not financial advice.",
          fontsize=7, color=DIM, ha="right", style="italic")
 
-out1 = f"{OUT_DIR}/LIVE_{sym}_donchian{BEST_N}.png"
-fig.savefig(out1, dpi=150, bbox_inches="tight", facecolor=BG)
-print(f"[OK]  Live equity chart  →  {out1}")
+if SAVE_PLOTS:
+    out1 = f"outputs/LIVE_{sym}_donchian{BEST_N}.png"
+    fig.savefig(out1, dpi=150, bbox_inches="tight", facecolor=BG)
+    print(f"[OK]  Live equity chart  →  {out1}")
+else:
+    plt.show()
 plt.close(fig)
 
 # ── Chart 2: Training comparison radar-style bar ─────────────────────
@@ -666,9 +669,12 @@ fig2.suptitle(
     f"Train 7yr  →  Live 1yr",
     color=WHT, fontsize=13, fontweight="bold"
 )
-out2 = f"{OUT_DIR}/TRAIN_{sym}_donchian_selection.png"
-fig2.savefig(out2, dpi=150, bbox_inches="tight", facecolor=BG)
-print(f"[OK]  Training chart  →  {out2}")
+if SAVE_PLOTS:
+    out2 = f"outputs/TRAIN_{sym}_donchian_selection.png"
+    fig2.savefig(out2, dpi=150, bbox_inches="tight", facecolor=BG)
+    print(f"[OK]  Training chart  →  {out2}")
+else:
+    plt.show()
 plt.close(fig2)
 
 # ═══════════════════════════════════════════════════════════════════════
