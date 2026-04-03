@@ -767,5 +767,53 @@ display(Image(out1))
 
 plt.close(fig)
 
+# Plot the result sapratly 
+
+# print equty cruv 
+plt.figure(figsize=(12,6))
+
+plt.plot(eq_live.index, eq_live.values, linewidth=2)
+plt.axhline(INITIAL_CAPITAL, linestyle="--")
+
+plt.title("Equity Curve")
+plt.xlabel("Date")
+plt.ylabel("Portfolio Value")
+
+plt.grid()
+
+# Save
+eq_path = "outputs/equity_curve.png"
+plt.savefig(eq_path, bbox_inches="tight")
+
+# Show
+from IPython.display import Image, display
+display(Image(eq_path))
+
+plt.close()
+
+
+# Max drawdown curve
+plt.figure(figsize=(12,4))
+
+dd = (eq_live / eq_live.cummax() - 1) * 100
+
+plt.fill_between(dd.index, dd.values, 0, alpha=0.3)
+plt.plot(dd.index, dd.values, linewidth=1)
+
+plt.title("Drawdown (%)")
+plt.xlabel("Date")
+plt.ylabel("Drawdown %")
+
+plt.grid()
+
+# Save
+dd_path = "outputs/drawdown.png"
+plt.savefig(dd_path, bbox_inches="tight")
+
+# Show
+display(Image(dd_path))
+
+plt.close()
+
 print(f"\n[OK]  Complete.  {len(pnls_live)} trades  |  "
       f"{len(rolls_live)} rollovers  |  {margin_calls} margin calls\n")
