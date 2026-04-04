@@ -198,3 +198,7 @@ Start building:
 
 👉 Alpha =
 **Mean Reversion + Conditions where it works**
+
+
+--------------------------------------------------
+
