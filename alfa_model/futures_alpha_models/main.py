@@ -1,6 +1,5 @@
 import warnings, itertools
 warnings.filterwarnings("ignore")
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -40,7 +39,7 @@ CFG = {
     ],
     "full_start":      "2010-01-01",
     "full_end":        "2024-12-31",
-    "initial_capital":  5_000_000,     # INR 50 Lakh
+    "initial_capital":  1_000_000,     # INR 10 Lakh
 
     # ── Hyperparameter grid (Training phase ONLY) ─────────────────────────
     "param_grid": {
@@ -55,7 +54,7 @@ CFG = {
     "short_pct":        0.25,   # top 25% by cs_rank    → SHORT
     "max_positions":    6,      # max concurrent open contracts
     "margin_pct":       0.20,   # SPAN + Exposure margin rate
-    "risk_pct":         0.015,  # 1.5% of equity = margin budget per trade
+    "risk_pct":         0.030,  # 2% of equity = margin budget per trade
     "max_margin_pct":   0.12,   # hard cap: 12% of equity per position
     "use_trend_filter": True,   # only trade with trend direction
     "ma_window":        20,     # MA period for trend filter
@@ -563,6 +562,8 @@ def compute_metrics(tdf: pd.DataFrame, edf: pd.DataFrame,
 
     return {
         "phase":               phase,
+        "initial_capital":     init,
+        "final_capital":       final,
         "total_ret_pct":       rp,
         "total_ret_inr":       ri,
         "cagr":                cagr,
@@ -745,8 +746,8 @@ def print_summary(pm: dict, bp: dict, gdf: pd.DataFrame,
 
     # Trade statistics
     prow("Win Rate (%)",           [fp(g(p,"win_rate"))            for p in phases])
-    prow("Initial Capital",         [fi(g(p,"total_ret_inr") + cfg["initial_capital"]) for p in phases])
-    prow("Final Equity",            [fi(g(p,"total_ret_inr") + cfg["initial_capital"]) for p in phases])
+    prow("Initial Capital",       [fi(g(p,"initial_capital"))      for p in phases])
+    prow("Final Capital",         [fi(g(p,"final_capital"))        for p in phases])
     prow("Profit Factor",          [f4(g(p,"profit_factor"))       for p in phases])
     prow("Expectancy / Trade",     [fi(g(p,"expectancy"))          for p in phases])
     prow("Avg Winner",             [fi(g(p,"avg_win"))             for p in phases])
