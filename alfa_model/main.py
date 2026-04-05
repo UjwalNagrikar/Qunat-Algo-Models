@@ -65,7 +65,7 @@ CFG = {
         "ONGC.NS",      "HCLTECH.NS",    "TECHM.NS",      "ULTRACEMCO.NS",
         "ASIANPAINT.NS",
     ],
-    "start": "2022-01-01",
+    "start": "2010-01-01",
     "end":   "2024-12-31",
 
     # Capital
