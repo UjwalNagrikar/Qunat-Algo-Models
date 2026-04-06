@@ -87,12 +87,12 @@ CFG = {
     "min_trades_opt": 80,
 
     # ── Fixed params ──────────────────────────────────────────────────────
-    "initial_capital":  5_000_000,
+    "initial_capital":  1000000,
     "long_pct":         0.25,
     "short_pct":        0.25,
     "max_positions":    6,
     "margin_pct":       0.20,
-    "risk_pct":         0.015,
+    "risk_pct":         0.020,
     "max_margin_pct":   0.12,
     "use_trend_filter": False,   # FIX 3: OFF by default for live NSE
     "ma_window":        20,
