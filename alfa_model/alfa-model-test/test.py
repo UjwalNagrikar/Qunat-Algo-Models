@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-  NSE FUTSTK BACKTESTING ENGINE  v6.0
+  NSE FUTSTK BACKTESTING ENGINE  v7.0
   Strategy : Cross-Sectional Mean Reversion  |  Futures (FUTSTK) Mechanics
   Universe : 12 NSE Large-Cap Stocks  |  2010 - 2024
 
@@ -100,21 +100,21 @@ CFG = {
     # Improvement 3: regime_filter tested as grid param
     # Improvement 5: stop_loss_pct tested as grid param
     "param_grid": {
-        "holding_period": [3, 5, 7],
-        "z_threshold":    [0.75, 1.00, 1.25],    # long-side threshold
-        "vol_threshold":  [0.030, 0.040, 0.050],  # wider range for live NSE
-        "short_z_mult":   [1.0, 1.5, 2.0],        # short fires at z × mult
+        "holding_period": [2, 3, 5],               # 2d added for faster turnover
+        "z_threshold":    [0.50, 0.75, 1.00],      # 0.50 added for more signals
+        "vol_threshold":  [0.035, 0.045, 0.055],   # wider — more stocks qualify
+        "short_z_mult":   [1.0, 1.5, 2.0],
     },
 
     # ── Fixed strategy params ─────────────────────────────────────────────
-    "min_trades_opt":    80,
-    "initial_capital":   5_000_000,
-    "long_pct":          0.25,
-    "short_pct":         0.25,
-    "max_positions":     6,
+    "min_trades_opt":    50,            # lowered — 10L capital generates fewer lots
+    "initial_capital":   1_000_000,   # INR 10 Lakh
+    "long_pct":          0.30,            # top/bottom 30% — wider signal net
+    "short_pct":         0.30,
+    "max_positions":     10,            # up from 6 — more concurrent positions
     "margin_pct":        0.20,
-    "risk_pct":          0.015,
-    "max_margin_pct":    0.12,
+    "risk_pct":          0.025,            # 2.5% — needed at 10L to reach min 1 lot
+    "max_margin_pct":    0.30,            # 30% cap — some stocks need >20% at 10L
     "regime_filter":     True,      # Improvement 3: ON for live NSE
     "regime_ma_window":  50,        # broad-market trend MA
     "vol_scale_sizing":  True,      # Improvement 4: vol-scaled lots
@@ -126,7 +126,8 @@ CFG = {
     "ma_window":         20,        # trend filter MA (for individual stocks)
     "use_trend_filter":  False,     # individual stock MA filter (off by default)
     "vol_window":        10,
-    "n_top_candidates":  10,
+    "n_top_candidates":  15,            # wider validation funnel
+    "cooldown_days":     2,             # re-entry after 2 days (faster turnover)
 
     # ── NSE Futures cost model ─────────────────────────────────────────────
     "brokerage_flat": 20.0,    "brokerage_pct": 0.0003,
@@ -382,7 +383,7 @@ def run_backtest(features, signals, ret_score, params, s_date, e_date):
     sl_pct   = params.get("stop_loss_pct",    None)   # 8% soft stop
     sl_mh    = int(params.get("stop_min_hold",   2))   # min days before stop fires
     maxp     = int(params.get("max_positions",   6))
-    cd       = int(params.get("cooldown_days",   3))
+    cd       = int(params.get("cooldown_days",   2))
     m_pct    = params.get("margin_pct",       0.20)
     r_pct    = params.get("risk_pct",         0.015)
     mm       = params.get("max_margin_pct",   0.12)
@@ -574,7 +575,7 @@ def run_optimisation(features, cfg):
     for vals in combos:
         p = {**cfg, **dict(zip(keys, vals)),
              "holding_period": int(vals[keys.index("holding_period")]),
-             "cooldown_days":  cfg.get("cooldown_days", 3)}
+             "cooldown_days":  cfg.get("cooldown_days", 2)}
         # cooldown_days not in grid for v6.0 — use fixed value 3
         try:
             sigs, sc = build_signals(features, p, s, e)
@@ -621,7 +622,7 @@ def run_validation(features, cfg, top_candidates):
         p = {**cfg,
              **{k: v for k, v in cand.items() if k in pg_keys},
              "holding_period": int(cand["holding_period"]),
-             "cooldown_days":  cfg.get("cooldown_days", 3)}
+             "cooldown_days":  cfg.get("cooldown_days", 2)}
         try:
             sigs, sc = build_signals(features, p, s, e)
             tdf, edf = run_backtest(features, sigs, sc, p, s, e)
@@ -662,7 +663,7 @@ def run_validation(features, cfg, top_candidates):
            "z_threshold":    float(w["z_threshold"]),
            "vol_threshold":  float(w["vol_threshold"]),
            "short_z_mult":   float(w["short_z_mult"]),
-           "cooldown_days":  cfg.get("cooldown_days", 3)}
+           "cooldown_days":  cfg.get("cooldown_days", 2)}
     return vdf, bp
 
 
@@ -701,11 +702,11 @@ def print_sheet1(opt_df, val_df, best_params, is_m, val_m, cfg, src):
         print(f"  {label:<{w}}{str(ov):>22}{str(vv):>22}")
 
     print(); print(SEP)
-    print("  SHEET 1  |  IN-SAMPLE  |  NSE FUTSTK ENGINE v6.0  |  Universe Capital")
+    print("  SHEET 1  |  IN-SAMPLE  |  NSE FUTSTK ENGINE v7.0  |  Universe Capital")
     print(SEP)
 
     # A. Setup
-    print(f"\n  A. SETUP & DATA  (v6.0 Enhancements)")
+    print(f"\n  A. SETUP & DATA  (v7.0 — 10 Lakh Capital, High-Volume)")
     print(SEP2)
     print(f"  Data Source     : {src}")
     print(f"  Universe        : {len(cfg['symbols'])} stocks  |  "
@@ -873,7 +874,7 @@ def print_sheet2(oos_m, best_params, is_m, val_m, src, runtime, cfg):
         print(f"  {label:<{w}}{str(val):>34}")
 
     print(); print(SEP)
-    print("  SHEET 2  |  OUT-OF-SAMPLE  |  NSE FUTSTK ENGINE v6.0  |  Universe Capital")
+    print("  SHEET 2  |  OUT-OF-SAMPLE  |  NSE FUTSTK ENGINE v7.0  |  Universe Capital")
     print("  PURE FORWARD TEST  |  Parameters frozen from IS — zero contact with OOS")
     print(SEP)
 
@@ -887,7 +888,7 @@ def print_sheet2(oos_m, best_params, is_m, val_m, src, runtime, cfg):
     print()
     lz  = best_params.get("z_threshold", 1.0)
     szm = best_params.get("short_z_mult", 1.5)
-    print(f"  LOCKED PARAMS (v6.0 asymmetric):")
+    print(f"  LOCKED PARAMS (v7.0 asymmetric):")
     print(f"    Holding Period    = {int(best_params['holding_period'])} days")
     print(f"    Long  Z-Threshold = {lz:.2f}σ")
     print(f"    Short Z-Threshold = {lz*szm:.2f}σ  (long × {szm:.1f})")
@@ -1001,7 +1002,7 @@ def print_sheet2(oos_m, best_params, is_m, val_m, src, runtime, cfg):
     print()
 
     if sh_oos > 1.5 and pf_oos > 1.3:
-        verdict = "STRONG    — Significantly improved vs v5.0. Deploy with monitoring."
+        verdict = "STRONG    — Significantly improved vs v6.0. Deploy with monitoring."
     elif sh_oos > 1.0 and pf_oos > 1.2:
         verdict = "SOLID     — Good OOS risk-adjusted return. Ready for paper trading."
     elif sh_oos > 0.5 and pf_oos > 1.0:
