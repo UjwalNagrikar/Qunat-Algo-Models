@@ -37,7 +37,6 @@ class MicrostructureStatArb:
         df['Intraday_Ret'] = (df['Close'] / df['Open']) - 1
 
         # 3. Rolling Statistics (10-day window)
-        # Shifted by 1 to avoid lookahead bias when making decisions
         df['Mean_Overnight'] = df['Overnight_Ret'].rolling(10).mean().shift(1)
         df['Std_Overnight'] = df['Overnight_Ret'].rolling(10).std().shift(1)
 
@@ -62,21 +61,20 @@ class MicrostructureStatArb:
         overnight_pos = 0
         overnight_type = None
         overnight_entry = 0.0
+        overnight_entry_date = None
 
         equity_curve = []
         completed_trades = []
 
         # --- HIGH FREQUENCY PARAMETERS ---
-        GAP_Z_LONG = -0.5     # Buy open if gap down > 0.5 std dev
-        GAP_Z_SHORT = 0.5     # Short open if gap up > 0.5 std dev
+        GAP_Z_LONG = -0.5
+        GAP_Z_SHORT = 0.5
 
-        INTRA_Z_LONG = 0.0    # Buy close if intraday action was negative
-        INTRA_Z_SHORT = 1.5   # Short close only if intraday rally was extreme (>1.5 std dev)
+        INTRA_Z_LONG = 0.0
+        INTRA_Z_SHORT = 1.5
 
-        RISK_FRACTION = 0.50  # Use 50% of capital per trade
-
-        # --- STOP LOSS PARAMETER ---
-        STOP_LOSS_PCT = 0.015 # 1.5% fixed stop loss per trade
+        RISK_FRACTION = 0.50
+        STOP_LOSS_PCT = 0.015
 
         for i in range(1, len(df)):
             date = df.index[i]
@@ -89,27 +87,39 @@ class MicrostructureStatArb:
             # MORNING: EXIT OVERNIGHT POSITION AT OPEN
             # ==========================================
             if overnight_pos > 0:
-                # Overnight trades exit at the Open price unconditionally
-                # (You cannot trigger a stop loss while the market is closed)
                 exit_price = open_price
 
                 if overnight_type == 'LONG':
-                    pnl = (exit_price - overnight_entry) * overnight_pos - (2 * self.brokerage_per_order)
+                    gross_pnl = (exit_price - overnight_entry) * overnight_pos
+                    chg_pts = exit_price - overnight_entry
                 else:
-                    pnl = (overnight_entry - exit_price) * overnight_pos - (2 * self.brokerage_per_order)
+                    gross_pnl = (overnight_entry - exit_price) * overnight_pos
+                    chg_pts = overnight_entry - exit_price
 
-                cash += (overnight_entry * overnight_pos) + pnl if overnight_type == 'LONG' else (overnight_entry * overnight_pos) + pnl
-                ret_pct = pnl / (overnight_entry * overnight_pos)
+                net_pnl = gross_pnl - (2 * self.brokerage_per_order)
+                cash += (overnight_entry * overnight_pos) + net_pnl
+                ret_pct = net_pnl / (overnight_entry * overnight_pos)
+
+                entry_ist = f"{overnight_entry_date} 15:30" if overnight_entry_date else "Unknown"
+                exit_ist = f"{date.strftime('%Y-%m-%d')} 09:15"
 
                 completed_trades.append({
-                    'Date': date.strftime('%Y-%m-%d'),
-                    'Trade': 'OVERNIGHT',
-                    'Type': overnight_type,
-                    'Entry': round(overnight_entry, 2),
-                    'Exit': round(exit_price, 2),
-                    'PnL (₹)': round(pnl, 2),
-                    'Return (%)': round(ret_pct * 100, 2),
-                    'Reason': 'Time Exit (Open)'
+                    '#': len(completed_trades) + 1,
+                    'Side': overnight_type,
+                    'Sig': 'O/N',
+                    'Entry (IST)': entry_ist,
+                    'Exit (IST)': exit_ist,
+                    'Bars': 1,
+                    'Entry₹': round(overnight_entry, 2),
+                    'Exit₹': round(exit_price, 2),
+                    'Lots': overnight_pos,
+                    'Notional₹': round(overnight_entry * overnight_pos, 2),
+                    'Gross₹': round(gross_pnl, 2),
+                    'Chg₹': round(chg_pts, 2),
+                    'Net₹': round(net_pnl, 2),
+                    'Capital₹': round(cash, 2),
+                    'Rsn': 'Time',
+                    'Return (%)': round(ret_pct * 100, 2) # Used for metrics/MC, hidden in print
                 })
                 overnight_pos = 0
                 overnight_type = None
@@ -144,37 +154,50 @@ class MicrostructureStatArb:
             # ==========================================
             if intraday_pos > 0:
                 exit_price = close_price
-                exit_reason = 'Time Exit (Close)'
+                exit_reason = 'Time Exit'
 
-                # Check if Intraday Stop Loss was hit using High/Low of the day
                 if intraday_type == 'LONG':
                     sl_price = intraday_entry * (1 - STOP_LOSS_PCT)
                     if low_price <= sl_price:
                         exit_price = sl_price
-                        exit_reason = 'Stop Loss Hit'
+                        exit_reason = 'Stop Loss'
 
-                    pnl = (exit_price - intraday_entry) * intraday_pos - (2 * self.brokerage_per_order)
+                    gross_pnl = (exit_price - intraday_entry) * intraday_pos
+                    chg_pts = exit_price - intraday_entry
 
                 else: # SHORT
                     sl_price = intraday_entry * (1 + STOP_LOSS_PCT)
                     if high_price >= sl_price:
                         exit_price = sl_price
-                        exit_reason = 'Stop Loss Hit'
+                        exit_reason = 'Stop Loss'
 
-                    pnl = (intraday_entry - exit_price) * intraday_pos - (2 * self.brokerage_per_order)
+                    gross_pnl = (intraday_entry - exit_price) * intraday_pos
+                    chg_pts = intraday_entry - exit_price
 
-                cash += (intraday_entry * intraday_pos) + pnl
-                ret_pct = pnl / (intraday_entry * intraday_pos)
+                net_pnl = gross_pnl - (2 * self.brokerage_per_order)
+                cash += (intraday_entry * intraday_pos) + net_pnl
+                ret_pct = net_pnl / (intraday_entry * intraday_pos)
+
+                entry_ist = f"{date.strftime('%Y-%m-%d')} 09:15"
+                exit_ist = f"{date.strftime('%Y-%m-%d')} 15:30"
 
                 completed_trades.append({
-                    'Date': date.strftime('%Y-%m-%d'),
-                    'Trade': 'INTRADAY',
-                    'Type': intraday_type,
-                    'Entry': round(intraday_entry, 2),
-                    'Exit': round(exit_price, 2),
-                    'PnL (₹)': round(pnl, 2),
-                    'Return (%)': round(ret_pct * 100, 2),
-                    'Reason': exit_reason
+                    '#': len(completed_trades) + 1,
+                    'Side': intraday_type,
+                    'Sig': 'INTRA',
+                    'Entry (IST)': entry_ist,
+                    'Exit (IST)': exit_ist,
+                    'Bars': 1,
+                    'Entry₹': round(intraday_entry, 2),
+                    'Exit₹': round(exit_price, 2),
+                    'Lots': intraday_pos,
+                    'Notional₹': round(intraday_entry * intraday_pos, 2),
+                    'Gross₹': round(gross_pnl, 2),
+                    'Chg₹': round(chg_pts, 2),
+                    'Net₹': round(net_pnl, 2),
+                    'Capital₹': round(cash, 2),
+                    'Rsn': 'SL' if 'Stop Loss' in exit_reason else 'Time',
+                    'Return (%)': round(ret_pct * 100, 2) # Used for metrics/MC, hidden in print
                 })
                 intraday_pos = 0
 
@@ -195,11 +218,13 @@ class MicrostructureStatArb:
                         overnight_type = 'LONG'
                         overnight_pos = shares
                         overnight_entry = close_price
+                        overnight_entry_date = date.strftime('%Y-%m-%d')
                         cash -= (shares * close_price)
                     elif intra_z > INTRA_Z_SHORT:
                         overnight_type = 'SHORT'
                         overnight_pos = shares
                         overnight_entry = close_price
+                        overnight_entry_date = date.strftime('%Y-%m-%d')
                         cash -= (shares * close_price)
 
         equity_df = pd.DataFrame(equity_curve).set_index('Date')
@@ -215,12 +240,16 @@ class MicrostructureStatArb:
             print(f"No trades executed in {period_name}.")
             return
 
+        # Load into DataFrame and drop the metric-only column
         trades_df = pd.DataFrame(trades)
-        print("\n" + "="*100)
+        display_df = trades_df.drop(columns=['Return (%)'])
+
+        print("\n" + "="*145)
         print(f"DETAILED TRADE LOG: {period_name.upper()} (Unseen Data)")
-        print("="*100)
-        print(trades_df.to_string(index=False))
-        print("="*100 + "\n")
+        print("="*145)
+        # to_string(index=False) automatically formats everything into beautifully aligned columns
+        print(display_df.to_string(index=False))
+        print("="*145 + "\n")
 
     def calculate_metrics(self, period_name):
         equity_df = self.results[period_name]['equity_df']
@@ -242,14 +271,14 @@ class MicrostructureStatArb:
         drawdown = (equity - running_max) / running_max
         max_drawdown = drawdown.min()
 
-        winning_trades = [t for t in trades if t['PnL (₹)'] > 0]
-        losing_trades = [t for t in trades if t['PnL (₹)'] <= 0]
+        winning_trades = [t for t in trades if t['Net₹'] > 0]
+        losing_trades = [t for t in trades if t['Net₹'] <= 0]
 
         total_trades = len(trades)
         win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0
 
-        gross_profit = sum(t['PnL (₹)'] for t in winning_trades)
-        gross_loss = abs(sum(t['PnL (₹)'] for t in losing_trades))
+        gross_profit = sum(t['Net₹'] for t in winning_trades)
+        gross_loss = abs(sum(t['Net₹'] for t in losing_trades))
         profit_factor = gross_profit / gross_loss if gross_loss != 0 else float('inf')
 
         print(f"\n--- {period_name.upper()} METRICS ---")
