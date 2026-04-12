@@ -1,17 +1,3 @@
-"""
-Nifty 50 Quant System v3.0 — UNiverse Capital
-==============================================
-v3 fixes over v2:
-  1. Transaction cost bug fixed (was charging 3x, now 2x)
-  2. Long-biased signal design (Nifty is a secular bull — shorts need 2x threshold)
-  3. Longer momentum windows (10d/20d/30d) for better trend capture
-  4. MIN_HOLD=5, MAX_HOLD=15 -> better cost amortisation
-  5. Rolling metrics clipped to [-5,5] — no more 1e6 axis scale
-  6. Win-rate computed on trade days only, not flat days
-  7. Visual metrics dashboard fully redesigned
-Run: python model.py
-"""
-
 import warnings; warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
@@ -836,5 +822,5 @@ if __name__=="__main__":
 improvement  = """
 
     tarine 8 yers of data then back test on 2 yeard unseen data 
-    
+
 """
