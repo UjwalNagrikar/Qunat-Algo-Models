@@ -1,22 +1,8 @@
-"""
-Institutional-Grade Nifty 50 Quantitative Trading System — v2.0
-================================================================
-Non-lagging, multi-factor signal model with multi-day holding periods.
-Key fixes over v1:
-  - Signal confirmation (2-day persistence) → reduces noise trades
-  - Multi-day position holding (3-10 days) → amortizes transaction costs
-  - Proper DFA-based Hurst exponent for regime detection
-  - Stronger composite score threshold → fewer, higher-conviction trades
-  - Full professional dark-theme visualizations
-Run: python model.py
-"""
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1: IMPORTS & CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 import warnings
 warnings.filterwarnings("ignore")
-
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -1094,7 +1080,6 @@ def main() -> None:
     print("\n" + "═"*66)
     print("  PIPELINE COMPLETE ✓")
     print("═"*66 + "\n")
-
 
 if __name__ == "__main__":
     main()
