@@ -1,1085 +1,840 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 1: IMPORTS & CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-import warnings
-warnings.filterwarnings("ignore")
+"""
+Nifty 50 Quant System v3.0 — UNiverse Capital
+==============================================
+v3 fixes over v2:
+  1. Transaction cost bug fixed (was charging 3x, now 2x)
+  2. Long-biased signal design (Nifty is a secular bull — shorts need 2x threshold)
+  3. Longer momentum windows (10d/20d/30d) for better trend capture
+  4. MIN_HOLD=5, MAX_HOLD=15 -> better cost amortisation
+  5. Rolling metrics clipped to [-5,5] — no more 1e6 axis scale
+  6. Win-rate computed on trade days only, not flat days
+  7. Visual metrics dashboard fully redesigned
+Run: python model.py
+"""
+
+import warnings; warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 import seaborn as sns
 from scipy import stats
 from scipy.stats import gaussian_kde
 import yfinance as yf
-from tabulate import tabulate
 from datetime import datetime, timedelta
 
 np.random.seed(42)
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 TICKER          = "^NSEI"
-INITIAL_CAPITAL = 1_000_000      # INR 10 lakhs
-TC              = 0.0005         # 0.05% per side
-SLIPPAGE        = 0.0002         # 0.02% per side
-RISK_FREE       = 0.065          # 6.5% Indian 10Y G-Sec
-KELLY_CAP       = 1.5            # max position multiplier
-HURST_TREND     = 0.55
-HURST_MR        = 0.45
-VOL_FILTER_PCT  = 92             # skip top 8% extreme-vol days
-SCORE_THRESH    = 1.8            # minimum |composite score| to trade
-CONFIRM_DAYS    = 2              # signal must persist N days before entry
-MAX_HOLD        = 8              # max days to hold a position
-MIN_HOLD        = 3              # minimum days before considering exit
+INITIAL_CAPITAL = 1_000_000
+TC              = 0.0005
+SLIPPAGE        = 0.0002
+RISK_FREE       = 0.065
+KELLY_CAP       = 1.0
+HURST_TREND     = 0.52
+HURST_MR        = 0.44
+VOL_FILTER_PCT  = 93
+SCORE_LONG      = 2.0
+SCORE_SHORT     = 3.8
+CONFIRM_DAYS    = 2
+MIN_HOLD        = 5
+MAX_HOLD        = 15
 TRADING_DAYS    = 252
 
-# ── Visual theme ─────────────────────────────────────────────────────────────
-BG       = "#0D1117"
-PANEL_BG = "#161B22"
-BORDER   = "#30363D"
-TEXT     = "#E6EDF3"
-MUTED    = "#8B949E"
-ACCENT   = "#58A6FF"      # blue
-GREEN    = "#3FB950"
-RED      = "#F85149"
-GOLD     = "#D29922"
-PURPLE   = "#BC8CFF"
-ORANGE   = "#FFA657"
-CYAN     = "#39D353"
-
-PDF_FILE   = "nifty50_quant_report.pdf"
-TRADES_CSV = "trades_log.csv"
-EQUITY_CSV = "equity_curve.csv"
+BG=      "#0D1117"
+PANEL_BG="#161B22"
+BORDER=  "#30363D"
+TEXT=    "#E6EDF3"
+MUTED=   "#8B949E"
+ACCENT=  "#58A6FF"
+GREEN=   "#3FB950"
+RED=     "#F85149"
+GOLD=    "#D29922"
+PURPLE=  "#BC8CFF"
+ORANGE=  "#FFA657"
+CYAN=    "#39D353"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 2: DATA DOWNLOAD
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Data ──────────────────────────────────────────────────────────────────────
 
-def _generate_synthetic_nifty(start: datetime, end: datetime) -> pd.DataFrame:
-    """Synthetic Nifty 50 OHLCV via GBM + AR(1), calibrated to 2014-2024 historical params."""
-    print("[DATA] Generating calibrated synthetic Nifty 50 data ...")
-    annual_mu = 0.13; annual_sigma = 0.175; ar1 = 0.08
-    jump_prob = 0.015; jump_mu = -0.02; jump_sigma = 0.04; base = 8000.0
-    bdays = pd.bdate_range(start=start, end=end); n = len(bdays)
-    dt = 1 / TRADING_DAYS; sig_d = annual_sigma * np.sqrt(dt)
-    eps = np.random.normal(0, 1, n)
-    ar_eps = np.zeros(n); ar_eps[0] = eps[0]
-    for i in range(1, n):
-        ar_eps[i] = ar1 * ar_eps[i-1] + eps[i] * np.sqrt(1 - ar1**2)
-    jumps = np.where(np.random.rand(n) < jump_prob,
-                     np.random.normal(jump_mu, jump_sigma, n), 0.0)
-    lr = annual_mu * dt - 0.5 * annual_sigma**2 * dt + sig_d * ar_eps + jumps
-    closes = base * np.exp(np.cumsum(lr))
-    iv = annual_sigma * np.sqrt(dt) * np.random.uniform(0.5, 2.0, n)
-    opens  = closes * np.exp(np.random.normal(0, iv * 0.3, n))
-    highs  = np.maximum(opens, closes) * np.exp(np.abs(np.random.normal(0, iv * 0.5, n)))
-    lows   = np.minimum(opens, closes) * np.exp(-np.abs(np.random.normal(0, iv * 0.5, n)))
-    vols   = (200_000_000 * np.random.lognormal(0, 0.5, n)).astype(int)
-    df = pd.DataFrame({"Open": opens, "High": highs, "Low": lows,
-                        "Close": closes, "Volume": vols}, index=bdays)
-    df["High"] = df[["Open","High","Close"]].max(axis=1)
-    df["Low"]  = df[["Open","Low","Close"]].min(axis=1)
+def _synthetic(start, end):
+    print("[DATA] Using calibrated synthetic Nifty 50 data ...")
+    am,av,ar = 0.13,0.175,0.08
+    bdays = pd.bdate_range(start,end); n=len(bdays)
+    dt=1/TRADING_DAYS; sd=av*np.sqrt(dt)
+    eps=np.random.normal(0,1,n); ae=np.zeros(n); ae[0]=eps[0]
+    for i in range(1,n): ae[i]=ar*ae[i-1]+eps[i]*np.sqrt(1-ar**2)
+    jmp=np.where(np.random.rand(n)<0.015,np.random.normal(-0.02,0.04,n),0)
+    lr=am*dt-0.5*av**2*dt+sd*ae+jmp
+    C=8000*np.exp(np.cumsum(lr))
+    iv=av*np.sqrt(dt)*np.random.uniform(0.5,2,n)
+    O=C*np.exp(np.random.normal(0,iv*0.3,n))
+    H=np.maximum(O,C)*np.exp(np.abs(np.random.normal(0,iv*0.5,n)))
+    L=np.minimum(O,C)*np.exp(-np.abs(np.random.normal(0,iv*0.5,n)))
+    V=(200_000_000*np.random.lognormal(0,0.5,n)).astype(int)
+    df=pd.DataFrame({"Open":O,"High":H,"Low":L,"Close":C,"Volume":V},index=bdays)
+    df["High"]=df[["Open","High","Close"]].max(axis=1)
+    df["Low"] =df[["Open","Low","Close"]].min(axis=1)
     return df.round(2)
 
 
-def download_data() -> pd.DataFrame:
-    """Download 10y Nifty 50 OHLCV; fall back to calibrated synthetic if unavailable."""
-    end   = datetime.today()
-    start = end - timedelta(days=365 * 10 + 5)
-    df    = pd.DataFrame()
-    print(f"[DATA] Attempting live download: {TICKER} ({start.date()} → {end.date()}) ...")
+def download_data():
+    end=datetime.today(); start=end-timedelta(days=365*10+5)
+    print(f"[DATA] Downloading {TICKER} ({start.date()} to {end.date()}) ...")
+    df=pd.DataFrame()
     try:
-        raw = yf.download(TICKER, start=start.strftime("%Y-%m-%d"),
-                          end=end.strftime("%Y-%m-%d"), interval="1d", progress=False)
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        raw = raw[["Open","High","Low","Close","Volume"]].dropna()
-        if len(raw) > 500:
-            df = raw.copy(); print(f"[DATA] Live data: {len(df)} rows ✓")
-        else:
-            raise ValueError("Insufficient rows")
+        raw=yf.download(TICKER,start=start.strftime("%Y-%m-%d"),
+                        end=end.strftime("%Y-%m-%d"),interval="1d",progress=False)
+        if isinstance(raw.columns,pd.MultiIndex): raw.columns=raw.columns.get_level_values(0)
+        raw=raw[["Open","High","Low","Close","Volume"]].dropna()
+        if len(raw)>500: df=raw.copy(); print(f"[DATA] Live: {len(df)} rows")
+        else: raise ValueError("Too few rows")
     except Exception as e:
-        print(f"[DATA] Live download unavailable ({e}). Using synthetic data.")
-        df = _generate_synthetic_nifty(start, end)
+        print(f"[DATA] Live unavailable ({e})")
+        df=_synthetic(start,end)
     df.dropna(inplace=True)
-    df.index = pd.to_datetime(df.index)
-    df = df[df["Volume"] > 0].sort_index()
-    print(f"[DATA] Shape: {df.shape} | Range: {df.index[0].date()} → {df.index[-1].date()}")
+    df.index=pd.to_datetime(df.index)
+    df=df[df["Volume"]>0].sort_index()
+    print(f"[DATA] Shape:{df.shape} | {df.index[0].date()} to {df.index[-1].date()}")
     print(df.head().to_string()); print()
-    df["log_ret"] = np.log(df["Close"] / df["Close"].shift(1))
+    df["log_ret"]=np.log(df["Close"]/df["Close"].shift(1))
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 3: FEATURE ENGINEERING
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Features ──────────────────────────────────────────────────────────────────
 
-def hurst_dfa(series: np.ndarray) -> float:
-    """Hurst exponent via Detrended Fluctuation Analysis — robust at short windows."""
-    n = len(series)
-    if n < 20: return 0.5
+def hurst_dfa(series):
+    n=len(series)
+    if n<20: return 0.5
     try:
-        x   = np.cumsum(series - series.mean())
-        scales = np.unique(np.logspace(np.log10(4), np.log10(n//4), 10).astype(int))
-        flucts = []
+        x=np.cumsum(series-series.mean())
+        scales=np.unique(np.logspace(np.log10(4),np.log10(n//4),12).astype(int))
+        flucts=[]
         for s in scales:
-            n_seg = n // s
-            if n_seg < 2: continue
-            f2 = []
-            for k in range(n_seg):
-                seg = x[k*s:(k+1)*s]
-                t   = np.arange(s)
-                coef= np.polyfit(t, seg, 1)
-                trend = np.polyval(coef, t)
-                f2.append(np.mean((seg - trend)**2))
+            ns=n//s
+            if ns<2: continue
+            f2=[]
+            for k in range(ns):
+                seg=x[k*s:(k+1)*s]; t=np.arange(s)
+                trend=np.polyval(np.polyfit(t,seg,1),t)
+                f2.append(np.mean((seg-trend)**2))
             flucts.append(np.sqrt(np.mean(f2)))
-        if len(flucts) < 4: return 0.5
-        log_s = np.log(scales[:len(flucts)])
-        log_f = np.log(np.array(flucts))
-        h, *_ = np.polyfit(log_s, log_f, 1)
-        return float(np.clip(h, 0.05, 0.95))
-    except Exception:
-        return 0.5
+        if len(flucts)<4: return 0.5
+        h,_=np.polyfit(np.log(scales[:len(flucts)]),np.log(flucts),1)
+        return float(np.clip(h,0.05,0.95))
+    except: return 0.5
 
 
-def parkinson_vol(high: pd.Series, low: pd.Series) -> pd.Series:
-    """Parkinson single-day high-low volatility estimator."""
-    return np.sqrt((1 / (4 * np.log(2))) * (np.log(high / low))**2)
-
-
-def variance_ratio_stat(log_ret: pd.Series, k: int = 5) -> pd.Series:
-    """Lo-MacKinlay variance ratio: VR > 1 → momentum, VR < 1 → mean-reversion."""
-    var1  = log_ret.rolling(k).var()
-    var_k = log_ret.rolling(k).sum().rolling(k).var()
-    return var_k / (var1 * k + 1e-12)
-
-
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute all non-lagging features using only data available at time T."""
-    f = df.copy()
-    O, H, L, C, V = f["Open"], f["High"], f["Low"], f["Close"], f["Volume"]
-    pC = C.shift(1)
-
-    # ── A. Price Action ──────────────────────────────────────────────────────
-    f["daily_ret"]    = (C - O) / (O + 1e-9)
-    f["intraday_rng"] = (H - L) / (O + 1e-9)
-    f["gap"]          = (O - pC) / (pC + 1e-9)
-    f["body_ratio"]   = np.abs(C - O) / (H - L + 1e-9)
-    f["upper_wick"]   = (H - np.maximum(O, C)) / (H - L + 1e-9)
-    f["lower_wick"]   = (np.minimum(O, C) - L) / (H - L + 1e-9)
-    f["gap_dir"]      = np.sign(f["gap"])
-
-    # ── B. Statistical / Volatility ──────────────────────────────────────────
-    f["realized_vol"]   = f["log_ret"].rolling(10).std() * np.sqrt(TRADING_DAYS)
-    vol_m, vol_s        = V.rolling(10).mean(), V.rolling(10).std()
-    f["vol_zscore"]     = (V - vol_m) / (vol_s + 1e-9)
-    f["parkinson_vol"]  = parkinson_vol(H, L)
-    f["vr_stat"]        = variance_ratio_stat(f["log_ret"], k=5)
-
-    # Multi-period returns (non-lagging: computed from available OHLC)
-    f["ret_3d"]   = C / C.shift(3) - 1
-    f["ret_5d"]   = C / C.shift(5) - 1
-    f["ret_10d"]  = C / C.shift(10) - 1
-
-    # ── C. Regime Detection ───────────────────────────────────────────────────
-    roll_min = C.rolling(20).min()
-    roll_max = C.rolling(20).max()
-    f["range_z"]  = (C - roll_min) / (roll_max - roll_min + 1e-9)
-
-    # Rolling Hurst via DFA — 60-day window
-    print("[FEATURE] Computing rolling Hurst exponent (DFA, 60d) ...")
-    lr_arr = f["log_ret"].values
-    hurst_arr = np.full(len(f), 0.5)
-    for i in range(60, len(f)):
-        hurst_arr[i] = hurst_dfa(lr_arr[i-60:i])
-    f["hurst"] = hurst_arr
-
+def compute_features(df):
+    f=df.copy()
+    O,H,L,C,V=f["Open"],f["High"],f["Low"],f["Close"],f["Volume"]
+    pC=C.shift(1)
+    f["daily_ret"]   =(C-O)/(O+1e-9)
+    f["intraday_rng"]=(H-L)/(O+1e-9)
+    f["gap"]         =(O-pC)/(pC+1e-9)
+    f["body_ratio"]  =np.abs(C-O)/(H-L+1e-9)
+    f["upper_wick"]  =(H-np.maximum(O,C))/(H-L+1e-9)
+    f["lower_wick"]  =(np.minimum(O,C)-L)/(H-L+1e-9)
+    f["gap_dir"]     =np.sign(f["gap"])
+    f["ret_5d"] =C/C.shift(5)-1
+    f["ret_10d"]=C/C.shift(10)-1
+    f["ret_20d"]=C/C.shift(20)-1
+    f["ret_30d"]=C/C.shift(30)-1
+    f["realized_vol"]=f["log_ret"].rolling(10).std()*np.sqrt(TRADING_DAYS)
+    vm,vs=V.rolling(10).mean(),V.rolling(10).std()
+    f["vol_zscore"]=(V-vm)/(vs+1e-9)
+    f["parkinson_vol"]=np.sqrt((1/(4*np.log(2)))*np.log(H/L)**2)
+    roll_min=C.rolling(20).min(); roll_max=C.rolling(20).max()
+    f["range_z"]=(C-roll_min)/(roll_max-roll_min+1e-9)
+    var1=f["log_ret"].rolling(5).var()
+    vark=f["log_ret"].rolling(5).sum().rolling(5).var()
+    f["vr"]=vark/(var1*5+1e-12)
+    print("[FEATURE] Computing rolling Hurst (DFA, 90d) ...")
+    lr_arr=f["log_ret"].values; h_arr=np.full(len(f),0.5)
+    for i in range(90,len(f)): h_arr[i]=hurst_dfa(lr_arr[i-90:i])
+    f["hurst"]=h_arr
     f.dropna(inplace=True)
     return f
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 4: SIGNAL GENERATION
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Signals ───────────────────────────────────────────────────────────────────
 
-def generate_signals(f: pd.DataFrame) -> pd.DataFrame:
-    """
-    Generate +1/-1/0 signals via composite scoring with:
-    - Regime-filtered routing (trend vs mean-reversion)
-    - Extreme-volatility filter
-    - Score threshold gate (min |score| = SCORE_THRESH)
-    - 2-day signal confirmation (reduces whipsaw)
-    """
-    s = f.copy()
-    pvol_thresh = np.nanpercentile(s["parkinson_vol"].values, VOL_FILTER_PCT)
+def generate_signals(f):
+    s=f.copy()
+    pvol_thresh=np.nanpercentile(s["parkinson_vol"].values,VOL_FILTER_PCT)
 
-    # ── Trend score ──────────────────────────────────────────────────────────
-    trend = pd.Series(0.0, index=s.index)
-    trend += np.where(s["ret_5d"]  > 0.015,  1.5, np.where(s["ret_5d"]  < -0.015, -1.5, 0.0))
-    trend += np.where(s["ret_3d"]  > 0.008,  1.0, np.where(s["ret_3d"]  < -0.008, -1.0, 0.0))
-    trend += np.where(s["gap_dir"] > 0,       0.5, np.where(s["gap_dir"] < 0,      -0.5, 0.0))
-    trend += np.where(s["body_ratio"] > 0.65, np.sign(s["daily_ret"]) * 0.5, 0.0)
-    trend += np.where(s["vol_zscore"] > 1.5,  np.sign(s["daily_ret"]) * 0.5, 0.0)
-    trend += np.where(s["vr_stat"]   > 1.1,   np.sign(s["ret_5d"]) * 0.5, 0.0)
+    m20=np.clip(s["ret_20d"]/0.025,-2,2)
+    m10=np.clip(s["ret_10d"]/0.015,-2,2)
+    m30=np.clip(s["ret_30d"]/0.035,-2,2)
+    m5 =np.clip(s["ret_5d"] /0.010,-1,1)
 
-    # ── Mean-reversion score ──────────────────────────────────────────────────
-    mr = pd.Series(0.0, index=s.index)
-    mr += np.where(s["range_z"]  < 0.15,  2.0, np.where(s["range_z"]  > 0.85, -2.0, 0.0))
-    mr += np.where(s["range_z"]  < 0.25,  0.8, np.where(s["range_z"]  > 0.75, -0.8, 0.0))
-    mr += np.where(s["lower_wick"] > 0.45,  0.8, 0.0)
-    mr += np.where(s["upper_wick"] > 0.45, -0.8, 0.0)
-    mr += np.where(s["ret_5d"]  < -0.02,  1.0, np.where(s["ret_5d"]  > 0.02, -1.0, 0.0))
-    mr += np.where(s["vr_stat"] < 0.85,  np.sign(0.5 - s["range_z"]) * 0.7, 0.0)
+    trend=pd.Series(0.0,index=s.index)
+    trend+=m20*1.5; trend+=m10*1.0; trend+=m30*0.8; trend+=m5*0.5
+    trend+=np.where(s["body_ratio"]>0.6, np.sign(s["daily_ret"])*0.4, 0.0)
+    trend+=np.where(s["vol_zscore"]>1.5, np.sign(s["daily_ret"])*0.5, 0.0)
+    trend+=np.where(s["vr"]>1.1, np.sign(s["ret_10d"])*0.4, 0.0)
+    trend+=np.where(s["range_z"]>0.70, 0.4, np.where(s["range_z"]<0.30,-0.4,0.0))
 
-    # ── Regime routing ────────────────────────────────────────────────────────
-    composite = np.where(s["hurst"] > HURST_TREND, trend,
-                np.where(s["hurst"] < HURST_MR,    mr, 0.0))
+    mr=pd.Series(0.0,index=s.index)
+    mr+=np.where(s["range_z"]<0.12,2.5,np.where(s["range_z"]<0.22,1.5,
+        np.where(s["range_z"]<0.30,0.8,0.0)))
+    mr+=np.where(s["lower_wick"]>0.50,1.0,np.where(s["lower_wick"]>0.40,0.6,0.0))
+    mr+=np.where(s["ret_5d"]<-0.025,1.0,np.where(s["ret_5d"]<-0.015,0.5,0.0))
+    mr+=np.where((s["vol_zscore"]>1.5)&(s["daily_ret"]<0),0.5,0.0)
 
-    # ── Filters ───────────────────────────────────────────────────────────────
-    composite = np.where(s["parkinson_vol"] > pvol_thresh, 0.0, composite)  # vol filter
-    raw_sig   = np.where(np.abs(composite) >= SCORE_THRESH, np.sign(composite), 0.0)
+    raw_score=np.where(s["hurst"]>HURST_TREND,trend.values,
+              np.where(s["hurst"]<HURST_MR,mr.values,0.0))
+    raw_sig=np.where(raw_score>= SCORE_LONG,  1.0,
+            np.where(raw_score<=-SCORE_SHORT, -1.0, 0.0))
+    raw_sig=np.where(s["parkinson_vol"]>pvol_thresh,0.0,raw_sig)
 
-    # ── Signal confirmation: require same signal for CONFIRM_DAYS ─────────────
-    raw_s = pd.Series(raw_sig, index=s.index)
-    confirmed = raw_s.copy() * 0
-    for i in range(CONFIRM_DAYS - 1, len(raw_s)):
-        window = raw_s.iloc[i - CONFIRM_DAYS + 1: i + 1]
-        if (window == 1.0).all():
-            confirmed.iloc[i] = 1.0
-        elif (window == -1.0).all():
-            confirmed.iloc[i] = -1.0
+    rs=pd.Series(raw_sig,index=s.index); confirmed=rs*0.0
+    for i in range(CONFIRM_DAYS-1,len(rs)):
+        w=rs.iloc[i-CONFIRM_DAYS+1:i+1]
+        if (w==1.0).all(): confirmed.iloc[i]=1.0
+        elif (w==-1.0).all(): confirmed.iloc[i]=-1.0
 
-    s["raw_score"]  = composite
-    s["signal"]     = confirmed
-
-    # ── Kelly + volatility sizing ─────────────────────────────────────────────
-    trade_rets = s["log_ret"]
-    w_mask     = trade_rets > 0
-    avg_win    = trade_rets[w_mask].mean()  if w_mask.sum()  > 0 else 0.01
-    avg_loss   = trade_rets[~w_mask].abs().mean() if (~w_mask).sum() > 0 else 0.01
-    wr         = w_mask.mean()
-    kelly_f    = float(np.clip(
-        wr / (avg_loss + 1e-9) - (1 - wr) / (avg_win + 1e-9), 0.2, KELLY_CAP))
-
-    rv_norm    = s["realized_vol"] / (s["realized_vol"].mean() + 1e-9)
-    pos_size   = (kelly_f / (rv_norm + 1e-9)).clip(upper=KELLY_CAP)
-    s["pos_size"] = pos_size * np.abs(confirmed)
+    s["raw_score"]=raw_score; s["signal"]=confirmed
+    lr=s["log_ret"]; wm=lr>0
+    aw=lr[wm].mean() if wm.sum()>0 else 0.01
+    al=lr[~wm].abs().mean() if (~wm).sum()>0 else 0.01
+    wr=wm.mean()
+    kf=float(np.clip(wr/(al+1e-9)-(1-wr)/(aw+1e-9),0.2,KELLY_CAP))
+    rv=s["realized_vol"]/(s["realized_vol"].mean()+1e-9)
+    s["pos_size"]=(kf/(rv+1e-9)).clip(upper=KELLY_CAP)*np.abs(confirmed)
     return s
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 5: BACKTESTING ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Backtest ──────────────────────────────────────────────────────────────────
 
-def run_backtest(s: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Event-driven backtest with multi-day positions.
-    - Entry: T+1 Open after confirmed signal on T
-    - Exit: signal reversal OR MAX_HOLD days reached (min MIN_HOLD days held)
-    - No look-ahead bias: signal uses only day-T data
-    """
-    n      = len(s)
-    opens  = s["Open"].values
-    closes = s["Close"].values
-    sigs   = s["signal"].values
-    sizes  = s["pos_size"].values
-    dates  = s.index
+def run_backtest(s):
+    """Event-driven backtest. Costs charged once at entry, once at exit (2x total)."""
+    n=len(s); opens=s["Open"].values; closes=s["Close"].values
+    sigs=s["signal"].values; sizes=s["pos_size"].values; dates=s.index
+    portfolio=np.full(n,np.nan); benchmark=np.full(n,np.nan)
+    portfolio[0]=benchmark[0]=INITIAL_CAPITAL
+    capital=INITIAL_CAPITAL; bm_capital=INITIAL_CAPITAL
+    trade_log=[]; in_trade=False; pos_dir=0; entry_px=0.0
+    entry_cap=0.0; entry_date=None; hold_count=0
 
-    portfolio = np.full(n, np.nan)
-    benchmark = np.full(n, np.nan)
-    daily_pnl = np.zeros(n)
-    portfolio[0] = benchmark[0] = INITIAL_CAPITAL
+    for i in range(1,n):
+        bm_capital*=(1+(closes[i]-closes[i-1])/(closes[i-1]+1e-9))
+        benchmark[i]=bm_capital
+        prev_sig=sigs[i-1]
 
-    capital    = INITIAL_CAPITAL
-    bm_capital = INITIAL_CAPITAL
-    trade_log  = []
-
-    in_trade     = False
-    pos_dir      = 0
-    entry_px     = 0.0
-    entry_date   = None
-    entry_capital= 0.0
-    hold_count   = 0
-
-    for i in range(1, n):
-        # Benchmark: buy-and-hold daily return
-        bm_ret      = (closes[i] - closes[i-1]) / (closes[i-1] + 1e-9)
-        bm_capital *= (1 + bm_ret)
-        benchmark[i] = bm_capital
-
-        prev_sig = sigs[i-1]
-
-        # ── Check for exit ────────────────────────────────────────────────────
         if in_trade:
-            hold_count += 1
-            exit_now = False
-            if hold_count >= MIN_HOLD:
-                if prev_sig == -pos_dir or prev_sig == 0 or hold_count >= MAX_HOLD:
-                    exit_now = True
-
+            hold_count+=1
+            exit_now=False
+            if hold_count>=MIN_HOLD:
+                if prev_sig==-pos_dir or prev_sig==0 or hold_count>=MAX_HOLD:
+                    exit_now=True
             if exit_now:
-                exit_px   = opens[i]    # exit at next open
-                cost      = (TC + SLIPPAGE) * 2
-                raw_ret   = pos_dir * (exit_px - entry_px) / (entry_px + 1e-9)
-                net_ret   = raw_ret - cost
-                pnl_inr   = entry_capital * net_ret
-                capital  += pnl_inr
-                capital   = max(capital, 1)
-
+                exit_px=opens[i]
+                raw_ret=pos_dir*(exit_px-entry_px)/(entry_px+1e-9)
+                net_ret=raw_ret-(TC+SLIPPAGE)   # exit side only (entry already charged)
+                pnl_inr=entry_cap*net_ret
+                capital+=pnl_inr; capital=max(capital,1.0)
                 trade_log.append({
-                    "entry_date"  : str(entry_date)[:10],
-                    "exit_date"   : str(dates[i])[:10],
-                    "signal"      : int(pos_dir),
-                    "entry_price" : round(float(entry_px), 2),
-                    "exit_price"  : round(float(exit_px), 2),
-                    "pnl_pct"     : round(float(net_ret * 100), 4),
-                    "pnl_inr"     : round(float(pnl_inr), 2),
-                    "holding_days": hold_count,
+                    "entry_date" :str(entry_date)[:10],
+                    "exit_date"  :str(dates[i])[:10],
+                    "signal"     :int(pos_dir),
+                    "entry_price":round(float(entry_px),2),
+                    "exit_price" :round(float(exit_px),2),
+                    "pnl_pct"   :round(float(net_ret*100),4),
+                    "pnl_inr"   :round(float(pnl_inr),2),
+                    "holding_days":hold_count,
                 })
-                daily_pnl[i] += pnl_inr
-                in_trade = False; pos_dir = 0; hold_count = 0
+                in_trade=False; pos_dir=0; hold_count=0
 
-        # ── Check for entry ───────────────────────────────────────────────────
-        if not in_trade and prev_sig != 0:
-            sz           = float(sizes[i-1])
-            entry_capital= min(capital * sz, capital * KELLY_CAP)
-            entry_capital= min(entry_capital, capital)
-            entry_px     = opens[i]
-            entry_date   = dates[i]
-            pos_dir      = int(prev_sig)
-            in_trade     = True
-            hold_count   = 0
-            # Entry cost
-            cost_inr     = entry_capital * (TC + SLIPPAGE)
-            capital     -= cost_inr
-            capital      = max(capital, 1)
+        if not in_trade and prev_sig!=0:
+            sz=float(sizes[i-1])
+            entry_cap=min(capital*sz,capital)
+            capital-=entry_cap*(TC+SLIPPAGE)   # entry side cost
+            capital=max(capital,1.0)
+            entry_px=opens[i]; entry_date=dates[i]
+            pos_dir=int(prev_sig); in_trade=True; hold_count=0
 
-        portfolio[i] = capital
+        portfolio[i]=capital
 
-    # Fill any leading NaNs
-    portfolio = pd.Series(portfolio, index=s.index).ffill().fillna(INITIAL_CAPITAL)
-    benchmark = pd.Series(benchmark, index=s.index).ffill().fillna(INITIAL_CAPITAL)
-
-    result              = s.copy()
-    result["portfolio_value"]   = portfolio.values
-    result["benchmark_value"]   = benchmark.values
-    result["daily_pnl"]         = daily_pnl
-    result["strategy_returns"]  = portfolio.pct_change().fillna(0)
-    result["benchmark_returns"] = benchmark.pct_change().fillna(0)
-
-    trades_df = pd.DataFrame(trade_log)
-    return result, trades_df
+    portfolio=pd.Series(portfolio,index=s.index).ffill().fillna(INITIAL_CAPITAL)
+    benchmark=pd.Series(benchmark,index=s.index).ffill().fillna(INITIAL_CAPITAL)
+    r=s.copy()
+    r["portfolio_value"]=portfolio.values; r["benchmark_value"]=benchmark.values
+    r["strategy_returns"]=portfolio.pct_change().fillna(0)
+    r["benchmark_returns"]=benchmark.pct_change().fillna(0)
+    return r, pd.DataFrame(trade_log)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 6: PERFORMANCE METRICS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Metrics ───────────────────────────────────────────────────────────────────
 
-def drawdown_series(equity: np.ndarray) -> np.ndarray:
-    """Drawdown from rolling peak at each timestep."""
-    peak = np.maximum.accumulate(equity)
-    return (equity - peak) / (peak + 1e-9)
+def dd_series(eq):
+    pk=np.maximum.accumulate(eq); return (eq-pk)/(pk+1e-9)
 
-
-def max_dd_duration(dd: np.ndarray) -> int:
-    """Max consecutive days underwater."""
-    m = c = 0
-    for v in dd:
-        c = c + 1 if v < 0 else 0
-        m = max(m, c)
+def max_dd_dur(dd):
+    m=c=0
+    for v in dd: c=c+1 if v<0 else 0; m=max(m,c)
     return m
 
+def omega_ratio(ret,thr=0.0):
+    e=ret-thr; g=e[e>0].sum(); l=-e[e<0].sum(); return g/(l+1e-9)
 
-def omega_ratio(returns: np.ndarray, thr: float = 0.0) -> float:
-    """Omega ratio vs threshold."""
-    e = returns - thr
-    g = e[e > 0].sum(); l = -e[e < 0].sum()
-    return g / (l + 1e-9)
+def sortino_r(ret):
+    rf=RISK_FREE/TRADING_DAYS; down=ret[ret<rf]
+    s=down.std(ddof=1)*np.sqrt(TRADING_DAYS) if len(down)>1 else 1e-9
+    return float(np.clip((ret.mean()-rf)*TRADING_DAYS/(s+1e-9),-10,10))
 
-
-def sortino(returns: np.ndarray) -> float:
-    """Annualized Sortino ratio."""
-    rf_d   = RISK_FREE / TRADING_DAYS
-    excess = returns - rf_d
-    down   = returns[returns < rf_d]
-    semi   = down.std(ddof=1) * np.sqrt(TRADING_DAYS) if len(down) > 1 else 1e-9
-    return excess.mean() * TRADING_DAYS / (semi + 1e-9)
-
-
-def max_consec(wins: np.ndarray) -> tuple[int, int]:
-    """(max_consecutive_wins, max_consecutive_losses)."""
-    mw = ml = cw = cl = 0
+def max_consec(wins):
+    mw=ml=cw=cl=0
     for w in wins:
-        if w: cw += 1; cl = 0; mw = max(mw, cw)
-        else: cl += 1; cw = 0; ml = max(ml, cl)
-    return mw, ml
+        if w: cw+=1; cl=0; mw=max(mw,cw)
+        else: cl+=1; cw=0; ml=max(ml,cl)
+    return mw,ml
+
+def safe_sharpe(ret):
+    v=ret.std(ddof=1)*np.sqrt(TRADING_DAYS)
+    if v<1e-6: return 0.0
+    return float(np.clip((ret.mean()-RISK_FREE/TRADING_DAYS)*TRADING_DAYS/v,-5,5))
 
 
-def compute_metrics(result: pd.DataFrame, trades: pd.DataFrame) -> dict:
-    """Compute full strategy vs benchmark performance metrics."""
-    sr  = result["strategy_returns"].values
-    br  = result["benchmark_returns"].values
-    pv  = result["portfolio_value"].values
-    bv  = result["benchmark_value"].values
-    ny  = len(sr) / TRADING_DAYS
+def compute_metrics(r,trades):
+    sr=r["strategy_returns"].values; br=r["benchmark_returns"].values
+    pv=r["portfolio_value"].values;  bv=r["benchmark_value"].values
+    ny=len(sr)/TRADING_DAYS
 
-    def cagr(f, i, y):   return (f / i)**(1/y) - 1 if y > 0 else 0
-    def ann_vol(r):       return r.std(ddof=1) * np.sqrt(TRADING_DAYS)
-    def sharpe(r):
-        v = ann_vol(r)
-        return (r.mean() - RISK_FREE/TRADING_DAYS) * TRADING_DAYS / (v + 1e-9)
-    def var95(r):         return np.percentile(r, 5)
-    def cvar95(r):
-        v = var95(r); sub = r[r <= v]
-        return sub.mean() if len(sub) > 0 else v
+    def cagr(f,i,y): return (f/i)**(1/y)-1 if y>0 else 0
+    def av(ret): return ret.std(ddof=1)*np.sqrt(TRADING_DAYS)
+    def var95(ret): return np.percentile(ret,5)
+    def cvar95(ret):
+        v=var95(ret); sub=ret[ret<=v]; return sub.mean() if len(sub)>0 else v
 
-    dd_s = drawdown_series(pv)
-    dd_b = drawdown_series(bv)
+    dd_s=dd_series(pv); dd_b=dd_series(bv)
+    r2=r.copy(); r2.index=pd.to_datetime(r2.index)
+    ann_s=r2["strategy_returns"].resample("YE").apply(lambda x:(1+x).prod()-1)
+    ann_b=r2["benchmark_returns"].resample("YE").apply(lambda x:(1+x).prod()-1)
 
-    res2 = result.copy(); res2.index = pd.to_datetime(res2.index)
-    ann_s = res2["strategy_returns"].resample("YE").apply(lambda x: (1+x).prod()-1)
-    ann_b = res2["benchmark_returns"].resample("YE").apply(lambda x: (1+x).prod()-1)
-
-    m = {}
-    for tag, ret, eq, dd, ann in [
-        ("strategy",  sr, pv, dd_s, ann_s),
-        ("benchmark", br, bv, dd_b, ann_b),
-    ]:
-        cg = cagr(eq[-1], eq[0], ny)
-        m[tag] = {
-            "total_return"   : (eq[-1]/eq[0]-1)*100,
-            "cagr"           : cg*100,
-            "best_year"      : ann.max()*100,
-            "worst_year"     : ann.min()*100,
-            "avg_ann_ret"    : ann.mean()*100,
-            "ann_vol"        : ann_vol(ret)*100,
-            "max_drawdown"   : dd.min()*100,
-            "max_dd_dur"     : max_dd_duration(dd),
-            "avg_drawdown"   : dd[dd<0].mean()*100 if (dd<0).sum()>0 else 0,
-            "var95"          : var95(ret)*100,
-            "cvar95"         : cvar95(ret)*100,
-            "downside_dev"   : ret[ret<0].std(ddof=1)*np.sqrt(TRADING_DAYS)*100
-                               if (ret<0).sum()>1 else 0,
-            "sharpe"         : sharpe(ret),
-            "sortino"        : sortino(ret),
-            "calmar"         : cg / (abs(dd.min()) + 1e-9),
-            "omega"          : omega_ratio(ret),
-            "skewness"       : stats.skew(ret),
-            "kurtosis"       : stats.kurtosis(ret),
-            "hurst"          : hurst_dfa(ret[~np.isnan(ret)]),
-            "autocorr"       : pd.Series(ret).autocorr(lag=1),
+    m={}
+    for tag,ret,eq,dd,ann in [
+        ("strategy",sr,pv,dd_s,ann_s),("benchmark",br,bv,dd_b,ann_b)]:
+        cg=cagr(eq[-1],eq[0],ny)
+        m[tag]={
+            "total_return":(eq[-1]/eq[0]-1)*100,"cagr":cg*100,
+            "best_year":ann.max()*100,"worst_year":ann.min()*100,
+            "avg_ann_ret":ann.mean()*100,"ann_vol":av(ret)*100,
+            "max_dd":dd.min()*100,"max_dd_dur":max_dd_dur(dd),
+            "avg_dd":dd[dd<0].mean()*100 if (dd<0).sum()>0 else 0,
+            "var95":var95(ret)*100,"cvar95":cvar95(ret)*100,
+            "downside_dev":ret[ret<0].std(ddof=1)*np.sqrt(TRADING_DAYS)*100
+                           if (ret<0).sum()>1 else 0,
+            "sharpe":safe_sharpe(ret),"sortino":sortino_r(ret),
+            "calmar":cg/(abs(dd.min())+1e-9),"omega":omega_ratio(ret),
+            "skew":stats.skew(ret),"kurt":stats.kurtosis(ret),
+            "hurst":hurst_dfa(ret[~np.isnan(ret)]),"autocorr":pd.Series(ret).autocorr(lag=1),
         }
-    active = sr - br
-    te     = active.std(ddof=1) * np.sqrt(TRADING_DAYS)
-    m["strategy"]["info_ratio"]  = active.mean() * TRADING_DAYS / (te + 1e-9)
-    m["benchmark"]["info_ratio"] = 0.0
+    active=sr-br; te=active.std(ddof=1)*np.sqrt(TRADING_DAYS)
+    m["strategy"]["info_ratio"]=float(np.clip(active.mean()*TRADING_DAYS/(te+1e-9),-10,10))
+    m["benchmark"]["info_ratio"]=0.0
 
-    if len(trades) > 0:
-        w = trades["pnl_pct"] > 0
-        mw, ml = max_consec(w.values)
-        m["trades"] = {
-            "n_trades"    : len(trades),
-            "win_rate"    : w.mean()*100,
-            "avg_win"     : trades.loc[w,  "pnl_pct"].mean() if w.sum()>0 else 0,
-            "avg_loss"    : trades.loc[~w, "pnl_pct"].mean() if (~w).sum()>0 else 0,
-            "profit_factor": trades.loc[w, "pnl_pct"].sum() /
-                             (-trades.loc[~w,"pnl_pct"].sum()+1e-9),
-            "expectancy"  : trades["pnl_pct"].mean(),
-            "avg_hold"    : trades["holding_days"].mean(),
-            "max_w"       : mw, "max_l": ml,
+    if len(trades)>0:
+        w=trades["pnl_pct"]>0; mw,ml=max_consec(w.values)
+        m["trades"]={
+            "n_trades":len(trades),
+            "n_long":int((trades["signal"]==1).sum()),
+            "n_short":int((trades["signal"]==-1).sum()),
+            "win_rate":w.mean()*100,
+            "avg_win":trades.loc[w,"pnl_pct"].mean() if w.sum()>0 else 0,
+            "avg_loss":trades.loc[~w,"pnl_pct"].mean() if (~w).sum()>0 else 0,
+            "profit_factor":trades.loc[w,"pnl_pct"].sum()/(-trades.loc[~w,"pnl_pct"].sum()+1e-9),
+            "expectancy":trades["pnl_pct"].mean(),"avg_hold":trades["holding_days"].mean(),
+            "max_w":mw,"max_l":ml,
         }
     else:
-        m["trades"] = {k:0 for k in ["n_trades","win_rate","avg_win","avg_loss",
-                                      "profit_factor","expectancy","avg_hold","max_w","max_l"]}
+        m["trades"]={k:0 for k in ["n_trades","n_long","n_short","win_rate","avg_win",
+                                    "avg_loss","profit_factor","expectancy","avg_hold","max_w","max_l"]}
     return m
 
 
-def print_metrics(m: dict) -> None:
-    """Print formatted performance report."""
-    s, b, t = m["strategy"], m["benchmark"], m["trades"]
-    rows = [
-        ["── RETURN METRICS ──", "", ""],
-        ["Total Return (%)",          f"{s['total_return']:>8.2f}",   f"{b['total_return']:>8.2f}"],
-        ["CAGR (%)",                  f"{s['cagr']:>8.2f}",          f"{b['cagr']:>8.2f}"],
-        ["Best Year (%)",             f"{s['best_year']:>8.2f}",      f"{b['best_year']:>8.2f}"],
-        ["Worst Year (%)",            f"{s['worst_year']:>8.2f}",     f"{b['worst_year']:>8.2f}"],
-        ["Avg Annual Return (%)",     f"{s['avg_ann_ret']:>8.2f}",    f"{b['avg_ann_ret']:>8.2f}"],
-        ["── RISK METRICS ──", "", ""],
-        ["Annualized Volatility (%)", f"{s['ann_vol']:>8.2f}",        f"{b['ann_vol']:>8.2f}"],
-        ["Max Drawdown (%)",          f"{s['max_drawdown']:>8.2f}",   f"{b['max_drawdown']:>8.2f}"],
-        ["Max DD Duration (days)",    f"{s['max_dd_dur']:>8}",        f"{b['max_dd_dur']:>8}"],
-        ["Avg Drawdown (%)",          f"{s['avg_drawdown']:>8.2f}",   f"{b['avg_drawdown']:>8.2f}"],
-        ["VaR 95% (daily %)",        f"{s['var95']:>8.4f}",          f"{b['var95']:>8.4f}"],
-        ["CVaR 95% (daily %)",       f"{s['cvar95']:>8.4f}",         f"{b['cvar95']:>8.4f}"],
-        ["Downside Deviation (%)",    f"{s['downside_dev']:>8.4f}",   f"{b['downside_dev']:>8.4f}"],
-        ["── RISK-ADJUSTED ──", "", ""],
-        ["Sharpe Ratio",              f"{s['sharpe']:>8.4f}",         f"{b['sharpe']:>8.4f}"],
-        ["Sortino Ratio",             f"{s['sortino']:>8.4f}",        f"{b['sortino']:>8.4f}"],
-        ["Calmar Ratio",              f"{s['calmar']:>8.4f}",         f"{b['calmar']:>8.4f}"],
-        ["Omega Ratio",               f"{s['omega']:>8.4f}",          f"{b['omega']:>8.4f}"],
-        ["Information Ratio",         f"{s['info_ratio']:>8.4f}",     "     N/A"],
-        ["── TRADE METRICS ──", "", ""],
-        ["Total Trades",              f"{t['n_trades']:>8}",          "     N/A"],
-        ["Win Rate (%)",              f"{t['win_rate']:>8.2f}",       "     N/A"],
-        ["Avg Win (%)",               f"{t['avg_win']:>8.4f}",        "     N/A"],
-        ["Avg Loss (%)",              f"{t['avg_loss']:>8.4f}",       "     N/A"],
-        ["Profit Factor",             f"{t['profit_factor']:>8.4f}",  "     N/A"],
-        ["Expectancy (% / trade)",    f"{t['expectancy']:>8.4f}",     "     N/A"],
-        ["Avg Holding Period (days)", f"{t['avg_hold']:>8.2f}",       "     N/A"],
-        ["Max Consecutive Wins",      f"{t['max_w']:>8}",             "     N/A"],
-        ["Max Consecutive Losses",    f"{t['max_l']:>8}",             "     N/A"],
-        ["── STATISTICAL ──", "", ""],
-        ["Skewness",                  f"{s['skewness']:>8.4f}",       f"{b['skewness']:>8.4f}"],
-        ["Kurtosis",                  f"{s['kurtosis']:>8.4f}",       f"{b['kurtosis']:>8.4f}"],
-        ["Hurst Exponent",            f"{s['hurst']:>8.4f}",          f"{b['hurst']:>8.4f}"],
-        ["Autocorrelation (lag-1)",   f"{s['autocorr']:>8.4f}",       f"{b['autocorr']:>8.4f}"],
-    ]
-    print("\n" + "="*66)
-    print("  NIFTY 50 QUANT SYSTEM v2.0 — PERFORMANCE REPORT")
-    print("="*66)
-    print(tabulate(rows, headers=["Metric","Strategy","Benchmark"],
-                   tablefmt="simple", colalign=("left","right","right")))
-    print("="*66 + "\n")
+# ── Visualisations ────────────────────────────────────────────────────────────
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 7: VISUALIZATIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _setup_ax(ax, title="", xlabel="", ylabel=""):
-    """Apply consistent dark professional styling to an axes."""
-    ax.set_facecolor(PANEL_BG)
-    ax.tick_params(colors=TEXT, labelsize=8)
+def _ax(ax,title="",xl="",yl=""):
+    ax.set_facecolor(PANEL_BG); ax.tick_params(colors=TEXT,labelsize=8)
     ax.xaxis.label.set_color(TEXT); ax.yaxis.label.set_color(TEXT)
-    for spine in ax.spines.values():
-        spine.set_edgecolor(BORDER); spine.set_linewidth(0.8)
-    ax.grid(True, color=BORDER, alpha=0.5, linewidth=0.5)
-    if title:   ax.set_title(title,   color=GOLD,  fontsize=10, fontweight="bold", pad=8)
-    if xlabel:  ax.set_xlabel(xlabel, color=MUTED, fontsize=8)
-    if ylabel:  ax.set_ylabel(ylabel, color=MUTED, fontsize=8)
-    return ax
+    for sp in ax.spines.values(): sp.set_edgecolor(BORDER); sp.set_linewidth(0.8)
+    ax.grid(True,color=BORDER,alpha=0.45,linewidth=0.5,zorder=0)
+    if title: ax.set_title(title,color=GOLD,fontsize=10,fontweight="bold",pad=8)
+    if xl: ax.set_xlabel(xl,color=MUTED,fontsize=8)
+    if yl: ax.set_ylabel(yl,color=MUTED,fontsize=8)
 
 
-def _new_fig(nrows=1, ncols=1, figsize=(14,7), title=""):
-    """Create a new figure with dark background."""
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
-    fig.patch.set_facecolor(BG)
-    if title:
-        fig.suptitle(title, color=TEXT, fontsize=12, fontweight="bold", y=0.98)
-    return fig, axes
+def plot_metrics_dashboard(m):
+    """Full metrics rendered as a dark visual figure — no console text."""
+    s,b,t=m["strategy"],m["benchmark"],m["trades"]
+    fig=plt.figure(figsize=(20,12),facecolor=BG)
+    fig.suptitle("NIFTY 50 QUANT SYSTEM v3.0  |  PERFORMANCE DASHBOARD",
+                 color=TEXT,fontsize=15,fontweight="bold",y=0.98,fontfamily="monospace")
+
+    ax_hdr=fig.add_axes([0.01,0.920,0.98,0.040])
+    ax_hdr.set_facecolor("#1C2333"); ax_hdr.set_xticks([]); ax_hdr.set_yticks([])
+    for sp in ax_hdr.spines.values(): sp.set_edgecolor(BORDER)
+    for x,lbl,col in [(0.17,"METRIC",MUTED),(0.52,"STRATEGY",ACCENT),(0.78,"BENCHMARK",ORANGE)]:
+        ax_hdr.text(x,0.5,lbl,transform=ax_hdr.transAxes,color=col,
+                    fontsize=10,fontweight="bold",fontfamily="monospace",va="center",ha="center")
+
+    sections=[
+        ("RETURN METRICS",[
+            ("Total Return (%)",   f"{s['total_return']:+.2f}", f"{b['total_return']:+.2f}"),
+            ("CAGR (%)",           f"{s['cagr']:+.2f}",         f"{b['cagr']:+.2f}"),
+            ("Best Year (%)",      f"{s['best_year']:+.2f}",    f"{b['best_year']:+.2f}"),
+            ("Worst Year (%)",     f"{s['worst_year']:+.2f}",   f"{b['worst_year']:+.2f}"),
+            ("Avg Annual (%)",     f"{s['avg_ann_ret']:+.2f}",  f"{b['avg_ann_ret']:+.2f}"),
+        ]),
+        ("RISK METRICS",[
+            ("Ann. Volatility (%)", f"{s['ann_vol']:.2f}",       f"{b['ann_vol']:.2f}"),
+            ("Max Drawdown (%)",    f"{s['max_dd']:.2f}",        f"{b['max_dd']:.2f}"),
+            ("Max DD Dur. (days)",  f"{s['max_dd_dur']}",        f"{b['max_dd_dur']}"),
+            ("Avg Drawdown (%)",    f"{s['avg_dd']:.2f}",        f"{b['avg_dd']:.2f}"),
+            ("VaR 95% (%)",         f"{s['var95']:.4f}",         f"{b['var95']:.4f}"),
+            ("CVaR 95% (%)",        f"{s['cvar95']:.4f}",        f"{b['cvar95']:.4f}"),
+            ("Downside Dev (%)",    f"{s['downside_dev']:.4f}",  f"{b['downside_dev']:.4f}"),
+        ]),
+        ("RISK-ADJUSTED & STATS",[
+            ("Sharpe Ratio",       f"{s['sharpe']:.4f}",        f"{b['sharpe']:.4f}"),
+            ("Sortino Ratio",      f"{s['sortino']:.4f}",       f"{b['sortino']:.4f}"),
+            ("Calmar Ratio",       f"{s['calmar']:.4f}",        f"{b['calmar']:.4f}"),
+            ("Omega Ratio",        f"{s['omega']:.4f}",         f"{b['omega']:.4f}"),
+            ("Info. Ratio",        f"{s['info_ratio']:.4f}",    "    —"),
+            ("Skewness",           f"{s['skew']:.4f}",          f"{b['skew']:.4f}"),
+            ("Kurtosis",           f"{s['kurt']:.4f}",          f"{b['kurt']:.4f}"),
+            ("Hurst Exponent",     f"{s['hurst']:.4f}",         f"{b['hurst']:.4f}"),
+            ("Autocorr (lag-1)",   f"{s['autocorr']:.4f}",      f"{b['autocorr']:.4f}"),
+        ]),
+        ("TRADE EXECUTION",[
+            ("Total Trades",       f"{t['n_trades']}",          "    —"),
+            ("  Long Trades",      f"{t['n_long']}",            "    —"),
+            ("  Short Trades",     f"{t['n_short']}",           "    —"),
+            ("Win Rate (%)",       f"{t['win_rate']:.2f}",      "    —"),
+            ("Avg Win (%)",        f"{t['avg_win']:.4f}",       "    —"),
+            ("Avg Loss (%)",       f"{t['avg_loss']:.4f}",      "    —"),
+            ("Profit Factor",      f"{t['profit_factor']:.4f}", "    —"),
+            ("Expectancy (%/tr)",  f"{t['expectancy']:.4f}",    "    —"),
+            ("Avg Hold (days)",    f"{t['avg_hold']:.2f}",      "    —"),
+            ("Max Consec. Wins",   f"{t['max_w']}",             "    —"),
+            ("Max Consec. Loss",   f"{t['max_l']}",             "    —"),
+        ]),
+    ]
+
+    n_cols=len(sections); gap=0.010
+    col_w=(0.98-gap*(n_cols-1))/n_cols; top=0.910; bot=0.02
+
+    for ci,(title,rows) in enumerate(sections):
+        x0=0.01+ci*(col_w+gap)
+        ax=fig.add_axes([x0,bot,col_w,top-bot])
+        ax.set_facecolor(PANEL_BG); ax.set_xlim(0,1); ax.set_ylim(0,1)
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values(): sp.set_edgecolor(BORDER); sp.set_linewidth(0.9)
+        ax.add_patch(plt.Rectangle((0,0.958),1,0.042,fc="#1C2333",ec=BORDER,lw=0.7,transform=ax.transAxes))
+        ax.text(0.5,0.979,title,transform=ax.transAxes,color=GOLD,fontsize=9,
+                fontweight="bold",fontfamily="monospace",va="center",ha="center")
+        ax.text(0.04,0.942,"Metric",  color=MUTED, fontsize=7.5,fontfamily="monospace",transform=ax.transAxes,va="top")
+        ax.text(0.64,0.942,"Strat",   color=ACCENT,fontsize=7.5,fontfamily="monospace",transform=ax.transAxes,va="top",ha="center")
+        ax.text(0.88,0.942,"Bench",   color=ORANGE,fontsize=7.5,fontfamily="monospace",transform=ax.transAxes,va="top",ha="center")
+        ax.axhline(0.928, color=BORDER, lw=0.7, xmin=0.02, xmax=0.98)
+        n_r=len(rows); row_h=0.895/(n_r+0.5)
+        for ri,(lbl,sv,bv) in enumerate(rows):
+            y=0.920-ri*row_h
+            if ri%2==0:
+                ax.add_patch(plt.Rectangle((0.005,y-row_h*0.55),0.99,row_h*0.92,
+                                           fc="#1A2233",ec="none",transform=ax.transAxes,clip_on=True))
+            lbl_col=MUTED if lbl.startswith("  ") else TEXT
+            ax.text(0.04,y-row_h*0.05,lbl,color=lbl_col,fontsize=7.8,fontfamily="monospace",
+                    transform=ax.transAxes,va="center")
+            try:
+                n_sv=float(sv.replace("+","").replace(",",""))
+                sv_col=GREEN if n_sv>0 else (RED if n_sv<0 else TEXT)
+            except: sv_col=TEXT
+            ax.text(0.64,y-row_h*0.05,sv,color=sv_col,fontsize=7.8,fontweight="bold",
+                    fontfamily="monospace",transform=ax.transAxes,va="center",ha="center")
+            try:
+                n_bv=float(bv.strip().replace("+","").replace(",","").replace("—","0"))
+                bv_col=GREEN if n_bv>0 else (RED if n_bv<0 else MUTED)
+            except: bv_col=MUTED
+            ax.text(0.88,y-row_h*0.05,bv,color=bv_col,fontsize=7.8,fontfamily="monospace",
+                    transform=ax.transAxes,va="center",ha="center")
+        ax.add_patch(plt.Rectangle((0,0),1,0.003,fc=GOLD,ec="none",transform=ax.transAxes))
+
+    plt.show(); print("[PLOT 0] Metrics Dashboard ✓")
 
 
-# ─── Plot 1: Equity Curve ────────────────────────────────────────────────────
-def plot1_equity_curve(result: pd.DataFrame, pdf: PdfPages) -> None:
-    """Equity curve vs benchmark with drawdown shading and rolling Sharpe subplot."""
+def plot1_equity_curve(r):
     try:
-        fig = plt.figure(figsize=(15, 9), facecolor=BG)
-        gs  = gridspec.GridSpec(3, 1, figure=fig, hspace=0.08,
-                                height_ratios=[3, 1, 1])
-        ax1 = fig.add_subplot(gs[0])
-        ax2 = fig.add_subplot(gs[1], sharex=ax1)
-        ax3 = fig.add_subplot(gs[2], sharex=ax1)
+        fig=plt.figure(figsize=(15,9),facecolor=BG)
+        gs=gridspec.GridSpec(3,1,figure=fig,hspace=0.06,height_ratios=[3,1,1])
+        ax1=fig.add_subplot(gs[0]); ax2=fig.add_subplot(gs[1],sharex=ax1)
+        ax3=fig.add_subplot(gs[2],sharex=ax1)
         for ax in [ax1,ax2,ax3]: ax.set_facecolor(PANEL_BG)
-        fig.suptitle("EQUITY CURVE  ·  Strategy vs Nifty 50 Benchmark",
-                     color=TEXT, fontsize=13, fontweight="bold", y=0.99)
-
-        dates = result.index
-        norm_s = result["portfolio_value"]  / result["portfolio_value"].iloc[0]  * 100
-        norm_b = result["benchmark_value"]  / result["benchmark_value"].iloc[0]  * 100
-        dd     = drawdown_series(result["portfolio_value"].values)
-
-        ax1.plot(dates, norm_s, color=ACCENT,  lw=1.8, label="Strategy",  zorder=3)
-        ax1.plot(dates, norm_b, color=ORANGE,  lw=1.4, label="Benchmark (Nifty 50)", zorder=2, alpha=0.85)
-
-        # Shade significant drawdowns > 5%
-        in_dd = False; dd_start = None
-        for i, (d, v) in enumerate(zip(dates, dd)):
-            if v < -0.05 and not in_dd:
-                in_dd = True; dd_start = d
-            elif v >= -0.01 and in_dd:
-                ax1.axvspan(dd_start, d, color=RED, alpha=0.10, zorder=1)
-                in_dd = False
-        if in_dd: ax1.axvspan(dd_start, dates[-1], color=RED, alpha=0.10)
-
-        ax1.axhline(100, color=BORDER, lw=0.7, ls="--", alpha=0.6)
-        _setup_ax(ax1, ylabel="Indexed (base=100)")
-        ax1.legend(loc="upper left", framealpha=0.15, facecolor=PANEL_BG,
-                   edgecolor=BORDER, labelcolor=TEXT, fontsize=9)
-
-        # Drawdown fill
-        ax2.fill_between(dates, dd*100, 0, color=RED, alpha=0.5)
-        ax2.plot(dates, dd*100, color=RED, lw=0.6)
-        ax2.axhline(0, color=BORDER, lw=0.7)
-        _setup_ax(ax2, ylabel="Drawdown %")
-
-        # Rolling Sharpe (252d)
-        rs = result["strategy_returns"].rolling(TRADING_DAYS).apply(
-            lambda x: (x.mean()-RISK_FREE/TRADING_DAYS)/(x.std()+1e-9)*np.sqrt(TRADING_DAYS), raw=True)
-        ax3.plot(dates, rs, color=CYAN, lw=1.2)
-        ax3.axhline(1.0, color=GOLD, ls="--", lw=0.8, alpha=0.7)
-        ax3.axhline(0.0, color=MUTED, ls="-",  lw=0.5, alpha=0.4)
-        ax3.fill_between(dates, rs, 0, where=rs>0, color=CYAN, alpha=0.15)
-        ax3.fill_between(dates, rs, 0, where=rs<0, color=RED,  alpha=0.15)
-        _setup_ax(ax3, ylabel="252d Sharpe", xlabel="Date")
-
-        plt.setp(ax1.get_xticklabels(), visible=False)
-        plt.setp(ax2.get_xticklabels(), visible=False)
-        ax3.tick_params(axis="x", colors=TEXT, labelsize=8)
-        plt.tight_layout(rect=[0,0,1,0.97])
-        pdf.savefig(fig, facecolor=BG); plt.close(fig)
+        fig.suptitle("EQUITY CURVE  |  Strategy vs Nifty 50 Benchmark",
+                     color=TEXT,fontsize=13,fontweight="bold",y=0.99)
+        d=r.index
+        ns=r["portfolio_value"]/r["portfolio_value"].iloc[0]*100
+        nb=r["benchmark_value"]/r["benchmark_value"].iloc[0]*100
+        dd=dd_series(r["portfolio_value"].values)
+        ax1.plot(d,ns,color=ACCENT,lw=1.8,label="Strategy",zorder=3)
+        ax1.plot(d,nb,color=ORANGE,lw=1.4,label="Benchmark",zorder=2,alpha=0.85)
+        in_dd=False; ds=None
+        for dt,v in zip(d,dd):
+            if v<-0.05 and not in_dd: in_dd=True; ds=dt
+            elif v>=-0.01 and in_dd: ax1.axvspan(ds,dt,color=RED,alpha=0.10,zorder=1); in_dd=False
+        if in_dd: ax1.axvspan(ds,d[-1],color=RED,alpha=0.10)
+        ax1.axhline(100,color=BORDER,lw=0.7,ls="--",alpha=0.6)
+        _ax(ax1,yl="Indexed (base=100)")
+        ax1.legend(loc="upper left",framealpha=0.15,facecolor=PANEL_BG,edgecolor=BORDER,labelcolor=TEXT,fontsize=9)
+        ax2.fill_between(d,dd*100,0,color=RED,alpha=0.45)
+        ax2.plot(d,dd*100,color=RED,lw=0.6); ax2.axhline(0,color=BORDER,lw=0.6)
+        _ax(ax2,yl="Drawdown %")
+        rs=r["strategy_returns"].rolling(TRADING_DAYS).apply(
+            lambda x: 0.0 if x.std()<1e-6 else
+            float(np.clip((x.mean()-RISK_FREE/TRADING_DAYS)/x.std()*np.sqrt(TRADING_DAYS),-4,4)),raw=True)
+        ax3.plot(d,rs,color=CYAN,lw=1.2)
+        ax3.axhline(1.0,color=GOLD,ls="--",lw=0.8,alpha=0.7)
+        ax3.axhline(0.0,color=MUTED,ls="-",lw=0.5,alpha=0.4)
+        ax3.fill_between(d,rs,0,where=rs>0,color=CYAN,alpha=0.15)
+        ax3.fill_between(d,rs,0,where=rs<0,color=RED,alpha=0.15)
+        _ax(ax3,yl="252d Sharpe",xl="Date")
+        plt.setp(ax1.get_xticklabels(),visible=False)
+        plt.setp(ax2.get_xticklabels(),visible=False)
+        plt.tight_layout(rect=[0,0,1,0.97]); plt.show()
         print("[PLOT 1] Equity Curve ✓")
-    except Exception as e: print(f"[WARNING] Plot 1 failed: {e}")
+    except Exception as e: print(f"[WARNING] Plot 1: {e}")
 
 
-# ─── Plot 2: Drawdown ────────────────────────────────────────────────────────
-def plot2_drawdown(result: pd.DataFrame, pdf: PdfPages) -> None:
-    """Drawdown curve with top-5 annotated worst periods."""
+def plot2_drawdown(r):
     try:
-        fig, ax = _new_fig(figsize=(15, 6), title="DRAWDOWN ANALYSIS  ·  Rolling Underwater Equity")
-        _setup_ax(ax, ylabel="Drawdown (%)", xlabel="Date")
-
-        dates = result.index
-        dd    = drawdown_series(result["portfolio_value"].values)
-        dd_s  = pd.Series(dd * 100, index=dates)
-
-        ax.fill_between(dates, dd_s, 0, color=RED, alpha=0.35, label="Strategy Drawdown")
-        ax.plot(dates, dd_s, color=RED, lw=0.8)
-
-        # Benchmark drawdown overlay
-        dd_b = drawdown_series(result["benchmark_value"].values) * 100
-        ax.plot(dates, dd_b, color=ORANGE, lw=1.0, alpha=0.6, ls="--", label="Benchmark Drawdown")
-        ax.axhline(0, color=BORDER, lw=0.7)
-
-        # Top-5 worst drawdowns
-        troughs = []; in_dd = False; lmin = 0; lidx = 0
-        for i, v in enumerate(dd):
-            if v < 0:
-                if not in_dd: in_dd=True; lmin=v; lidx=i
-                elif v < lmin: lmin=v; lidx=i
+        fig,ax=plt.subplots(figsize=(15,6),facecolor=BG); ax.set_facecolor(PANEL_BG)
+        d=r.index; dd=dd_series(r["portfolio_value"].values)*100
+        ddb=dd_series(r["benchmark_value"].values)*100
+        dds=pd.Series(dd,index=d)
+        ax.fill_between(d,dds,0,color=RED,alpha=0.35,label="Strategy DD")
+        ax.plot(d,dds,color=RED,lw=0.8)
+        ax.plot(d,ddb,color=ORANGE,lw=1.0,alpha=0.6,ls="--",label="Benchmark DD")
+        ax.axhline(0,color=BORDER,lw=0.7)
+        troughs=[]; in_d=False; lm=0; li=0
+        for i,v in enumerate(dd/100):
+            if v<0:
+                if not in_d: in_d=True; lm=v; li=i
+                elif v<lm: lm=v; li=i
             else:
-                if in_dd: troughs.append((lmin, lidx)); in_dd=False
-        if in_dd: troughs.append((lmin, lidx))
-        top5 = sorted(troughs, key=lambda x: x[0])[:5]
-        for depth, idx in top5:
-            ax.annotate(f"{depth*100:.1f}%\n{str(dates[idx])[:10]}",
-                        xy=(dates[idx], depth*100),
-                        xytext=(15, 15), textcoords="offset points",
-                        color=GOLD, fontsize=7.5, fontweight="bold",
-                        arrowprops=dict(arrowstyle="-|>", color=GOLD, lw=0.8),
-                        bbox=dict(boxstyle="round,pad=0.3", fc=PANEL_BG, ec=BORDER, alpha=0.85))
-
-        ax.legend(framealpha=0.15, facecolor=PANEL_BG, edgecolor=BORDER,
-                  labelcolor=TEXT, fontsize=9)
-        plt.tight_layout()
-        pdf.savefig(fig, facecolor=BG); plt.close(fig)
-        print("[PLOT 2] Drawdown Curve ✓")
-    except Exception as e: print(f"[WARNING] Plot 2 failed: {e}")
+                if in_d: troughs.append((lm,li)); in_d=False
+        if in_d: troughs.append((lm,li))
+        for dp,idx in sorted(troughs,key=lambda x:x[0])[:5]:
+            ax.annotate(f"{dp*100:.1f}%\n{str(d[idx])[:10]}",
+                        xy=(d[idx],dp*100),xytext=(15,15),textcoords="offset points",
+                        color=GOLD,fontsize=7.5,fontweight="bold",
+                        arrowprops=dict(arrowstyle="-|>",color=GOLD,lw=0.8),
+                        bbox=dict(boxstyle="round,pad=0.3",fc=PANEL_BG,ec=BORDER,alpha=0.85))
+        _ax(ax,"DRAWDOWN ANALYSIS  |  Rolling Underwater Equity","Date","Drawdown (%)")
+        ax.legend(framealpha=0.15,facecolor=PANEL_BG,edgecolor=BORDER,labelcolor=TEXT,fontsize=9)
+        plt.tight_layout(); plt.show(); print("[PLOT 2] Drawdown ✓")
+    except Exception as e: print(f"[WARNING] Plot 2: {e}")
 
 
-# ─── Plot 3: Returns Distribution ────────────────────────────────────────────
-def plot3_returns_dist(result: pd.DataFrame, pdf: PdfPages) -> None:
-    """Return distribution with Normal/t-dist fits, KDE, VaR, CVaR lines."""
+def plot3_dist(r):
     try:
-        fig, axes = _new_fig(1, 2, figsize=(15, 6),
-                             title="RETURNS DISTRIBUTION  ·  Strategy vs Benchmark")
-        for ax, tag, ret_col, col in [
-            (axes[0], "Strategy",  "strategy_returns",  ACCENT),
-            (axes[1], "Benchmark", "benchmark_returns",  ORANGE),
-        ]:
-            ret = result[ret_col].dropna().values
-            ret = ret[np.abs(ret) < 0.12]   # trim extreme outliers for display
-            _setup_ax(ax, title=tag, xlabel="Daily Return (%)", ylabel="Density")
-
-            ax.hist(ret*100, bins=80, density=True, color=col, alpha=0.3,
-                    edgecolor="none", label="Observed")
-
-            x   = np.linspace(ret.min()*100, ret.max()*100, 400)
-            mu  = ret.mean()*100; sig = ret.std()*100
-            ax.plot(x, stats.norm.pdf(x, mu, sig), color=GREEN, lw=2, label="Normal Fit")
+        fig,axes=plt.subplots(1,2,figsize=(15,6),facecolor=BG)
+        fig.suptitle("RETURNS DISTRIBUTION  |  Strategy vs Benchmark",
+                     color=TEXT,fontsize=13,fontweight="bold")
+        for ax,ck,col,lbl in [(axes[0],"strategy_returns",ACCENT,"Strategy"),
+                               (axes[1],"benchmark_returns",ORANGE,"Benchmark")]:
+            ret=r[ck].dropna().values; ret=ret[np.abs(ret)<0.12]
+            _ax(ax,lbl,"Daily Return (%)","Density")
+            ax.hist(ret*100,bins=80,density=True,color=col,alpha=0.3,edgecolor="none")
+            x=np.linspace(ret.min()*100,ret.max()*100,400)
+            mu,sg=ret.mean()*100,ret.std()*100
+            ax.plot(x,stats.norm.pdf(x,mu,sg),color=GREEN,lw=2,label="Normal Fit")
             try:
-                df_t, loc_t, sc_t = stats.t.fit(ret*100)
-                ax.plot(x, stats.t.pdf(x, df_t, loc_t, sc_t),
-                        color=PURPLE, lw=2, ls="--", label=f"t-dist (df={df_t:.1f})")
-            except Exception: pass
-            try:
-                kde = gaussian_kde(ret*100)
-                ax.plot(x, kde(x), color=GOLD, lw=1.5, ls=":", label="KDE")
-            except Exception: pass
-
-            var95  = np.percentile(ret, 5)*100
-            cvar95 = ret[ret <= np.percentile(ret, 5)].mean()*100
-            ax.axvline(var95,  color=RED,    lw=1.5, ls="--", label=f"VaR 95%={var95:.2f}%")
-            ax.axvline(cvar95, color=PURPLE, lw=1.5, ls=":",  label=f"CVaR 95%={cvar95:.2f}%")
-
-            sk = stats.skew(ret); ku = stats.kurtosis(ret)
-            ax.text(0.97, 0.97, f"Skew: {sk:.3f}\nKurt: {ku:.3f}",
-                    transform=ax.transAxes, color=GOLD, fontsize=8.5,
-                    ha="right", va="top",
-                    bbox=dict(boxstyle="round,pad=0.4", fc=PANEL_BG, ec=BORDER, alpha=0.85))
-            ax.legend(framealpha=0.15, facecolor=PANEL_BG, edgecolor=BORDER,
-                      labelcolor=TEXT, fontsize=7.5)
-        plt.tight_layout()
-        pdf.savefig(fig, facecolor=BG); plt.close(fig)
-        print("[PLOT 3] Returns Distribution ✓")
-    except Exception as e: print(f"[WARNING] Plot 3 failed: {e}")
+                df_t,loc_t,sc_t=stats.t.fit(ret*100)
+                ax.plot(x,stats.t.pdf(x,df_t,loc_t,sc_t),color=PURPLE,lw=2,ls="--",
+                        label=f"t-dist (df={df_t:.1f})")
+            except: pass
+            try: ax.plot(x,gaussian_kde(ret*100)(x),color=GOLD,lw=1.5,ls=":",label="KDE")
+            except: pass
+            v95=np.percentile(ret,5)*100
+            cv95=ret[ret<=np.percentile(ret,5)].mean()*100
+            ax.axvline(v95,color=RED,lw=1.5,ls="--",label=f"VaR 95%={v95:.2f}%")
+            ax.axvline(cv95,color=PURPLE,lw=1.5,ls=":",label=f"CVaR 95%={cv95:.2f}%")
+            sk=stats.skew(ret); ku=stats.kurtosis(ret)
+            ax.text(0.97,0.97,f"Skew: {sk:.3f}\nKurt: {ku:.3f}",
+                    transform=ax.transAxes,color=GOLD,fontsize=8.5,ha="right",va="top",
+                    bbox=dict(boxstyle="round,pad=0.4",fc=PANEL_BG,ec=BORDER,alpha=0.85))
+            ax.legend(framealpha=0.15,facecolor=PANEL_BG,edgecolor=BORDER,labelcolor=TEXT,fontsize=7.5)
+        plt.tight_layout(); plt.show(); print("[PLOT 3] Returns Distribution ✓")
+    except Exception as e: print(f"[WARNING] Plot 3: {e}")
 
 
-# ─── Plot 4: Trade-by-Trade P&L ──────────────────────────────────────────────
-def plot4_trade_pnl(trades: pd.DataFrame, pdf: PdfPages) -> None:
-    """Scatter of per-trade P&L colored by win/loss, cumulative overlay."""
+def plot4_trades(trades):
     try:
-        if len(trades) == 0:
-            print("[WARNING] Plot 4 skipped: no trades."); return
-        fig, ax1 = plt.subplots(figsize=(15, 6), facecolor=BG)
-        _setup_ax(ax1, title="TRADE-BY-TRADE P&L  ·  Execution Quality",
-                  xlabel="Entry Date", ylabel="Trade P&L (%)")
-        ax2 = ax1.twinx()
-        ax2.set_facecolor(PANEL_BG)
-        ax2.tick_params(colors=GOLD, labelsize=8)
-
-        t2   = trades.copy()
-        t2["entry_date"] = pd.to_datetime(t2["entry_date"])
-        wins = t2["pnl_pct"] > 0
-        sz   = np.clip(t2["holding_days"] * 25, 15, 250)
-
-        ax1.scatter(t2.loc[wins,  "entry_date"], t2.loc[wins,  "pnl_pct"],
-                    c=GREEN, s=sz[wins],  alpha=0.75, zorder=3, label="Win",
-                    edgecolors="none")
-        ax1.scatter(t2.loc[~wins, "entry_date"], t2.loc[~wins, "pnl_pct"],
-                    c=RED,   s=sz[~wins], alpha=0.75, zorder=3, label="Loss",
-                    edgecolors="none")
-        ax1.axhline(0, color=BORDER, lw=0.8)
-        ax1.legend(loc="upper left", framealpha=0.15, facecolor=PANEL_BG,
-                   edgecolor=BORDER, labelcolor=TEXT, fontsize=9)
-
-        cum = t2["pnl_pct"].cumsum()
-        ax2.plot(t2["entry_date"], cum, color=GOLD, lw=1.8, label="Cumulative P&L (%)")
-        ax2.fill_between(t2["entry_date"], cum, 0, color=GOLD, alpha=0.08)
-        ax2.set_ylabel("Cumulative P&L (%)", color=GOLD, fontsize=8)
-        ax2.legend(loc="upper right", framealpha=0.15, facecolor=PANEL_BG,
-                   edgecolor=BORDER, labelcolor=TEXT, fontsize=9)
-
-        # Legend for dot sizes
-        for d, lbl in [(1,"1d"),(5,"5d"),(10,"10d")]:
-            ax1.scatter([], [], c="white", s=np.clip(d*25,15,250), alpha=0.5, label=f"Hold: {lbl}")
-        plt.tight_layout()
-        pdf.savefig(fig, facecolor=BG); plt.close(fig)
-        print("[PLOT 4] Trade P&L ✓")
-    except Exception as e: print(f"[WARNING] Plot 4 failed: {e}")
+        if len(trades)==0: print("[WARNING] Plot 4 skipped."); return
+        fig,ax1=plt.subplots(figsize=(15,6),facecolor=BG)
+        ax1.set_facecolor(PANEL_BG); ax2=ax1.twinx(); ax2.set_facecolor(PANEL_BG)
+        t2=trades.copy(); t2["entry_date"]=pd.to_datetime(t2["entry_date"])
+        w=t2["pnl_pct"]>0; sz=np.clip(t2["holding_days"]*25,20,300)
+        ax1.scatter(t2.loc[w,"entry_date"],t2.loc[w,"pnl_pct"],
+                    c=GREEN,s=sz[w],alpha=0.75,zorder=3,label="Win",edgecolors="none")
+        ax1.scatter(t2.loc[~w,"entry_date"],t2.loc[~w,"pnl_pct"],
+                    c=RED,s=sz[~w],alpha=0.75,zorder=3,label="Loss",edgecolors="none")
+        ax1.axhline(0,color=BORDER,lw=0.8)
+        _ax(ax1,"TRADE-BY-TRADE P&L  |  Execution Quality","Entry Date","Trade P&L (%)")
+        ax1.legend(loc="upper left",framealpha=0.15,facecolor=PANEL_BG,edgecolor=BORDER,labelcolor=TEXT,fontsize=9)
+        cum=t2["pnl_pct"].cumsum()
+        ax2.plot(t2["entry_date"],cum,color=GOLD,lw=1.8)
+        ax2.fill_between(t2["entry_date"],cum,0,color=GOLD,alpha=0.08)
+        ax2.set_ylabel("Cumulative P&L (%)",color=GOLD,fontsize=8)
+        ax2.tick_params(colors=GOLD,labelsize=8)
+        plt.tight_layout(); plt.show(); print("[PLOT 4] Trade P&L ✓")
+    except Exception as e: print(f"[WARNING] Plot 4: {e}")
 
 
-# ─── Plot 5: Rolling Metrics ─────────────────────────────────────────────────
-def plot5_rolling(result: pd.DataFrame, pdf: PdfPages) -> None:
-    """4-panel rolling metrics: Sharpe, Sortino, Volatility, Win Rate."""
+def plot5_rolling(r,trades):
+    """Rolling metrics — all Sharpe/Sortino clipped to [-5,5], win rate on trade days only."""
     try:
-        fig = plt.figure(figsize=(15, 12), facecolor=BG)
-        fig.suptitle("ROLLING PERFORMANCE METRICS  ·  63-Day Window",
-                     color=TEXT, fontsize=13, fontweight="bold", y=0.99)
-        axes = [fig.add_subplot(4,1,i+1) for i in range(4)]
+        fig=plt.figure(figsize=(15,12),facecolor=BG)
+        fig.suptitle("ROLLING PERFORMANCE METRICS  |  63-Day Window",
+                     color=TEXT,fontsize=13,fontweight="bold",y=0.99)
+        axes=[fig.add_subplot(4,1,i+1) for i in range(4)]
         for ax in axes: ax.set_facecolor(PANEL_BG)
+        W=63; d=r.index; ret=r["strategy_returns"]
 
-        W   = 63
-        ret = result["strategy_returns"]
-        d   = result.index
+        def roll_sh(x):
+            s=x.std()
+            return 0.0 if s<1e-6 else float(np.clip((x.mean()-RISK_FREE/TRADING_DAYS)/s*np.sqrt(TRADING_DAYS),-5,5))
+        def roll_so(x):
+            down=x[x<RISK_FREE/TRADING_DAYS]
+            s=down.std()*np.sqrt(TRADING_DAYS) if len(down)>1 else 1e-9
+            return 0.0 if s<1e-6 else float(np.clip((x.mean()-RISK_FREE/TRADING_DAYS)*TRADING_DAYS/s,-5,5))
+        def trade_wr(x):
+            nz=x[x!=0]; return (nz>0).mean()*100 if len(nz)>0 else np.nan
 
-        # Sharpe
-        rsh = ret.rolling(W).apply(
-            lambda x: (x.mean()-RISK_FREE/TRADING_DAYS)/(x.std()+1e-9)*np.sqrt(TRADING_DAYS), raw=True)
-        axes[0].plot(d, rsh, color=ACCENT, lw=1.2)
-        axes[0].axhline(1.0, color=GOLD, ls="--", lw=0.9, alpha=0.8)
-        axes[0].axhline(0.0, color=MUTED, ls="-",  lw=0.5, alpha=0.4)
-        axes[0].fill_between(d, rsh, 0, where=rsh>0, color=ACCENT, alpha=0.15)
-        axes[0].fill_between(d, rsh, 0, where=rsh<0, color=RED,    alpha=0.15)
-        _setup_ax(axes[0], ylabel="Sharpe")
-        axes[0].annotate("Sharpe = 1.0", xy=(d[int(len(d)*0.02)], 1.05),
-                         color=GOLD, fontsize=7.5)
+        rsh=ret.rolling(W).apply(roll_sh,raw=False)
+        rsort=ret.rolling(W).apply(roll_so,raw=False)
+        rvol=ret.rolling(W).std()*np.sqrt(TRADING_DAYS)*100
+        rwr=ret.rolling(W).apply(trade_wr,raw=False)
 
-        # Sortino
-        def rs(x):
-            down = x[x < RISK_FREE/TRADING_DAYS]
-            s    = down.std() * np.sqrt(TRADING_DAYS) if len(down)>1 else 1e-9
-            return (x.mean()-RISK_FREE/TRADING_DAYS)*TRADING_DAYS/(s+1e-9)
-        rsort = ret.rolling(W).apply(rs, raw=False)
-        axes[1].plot(d, rsort, color=GREEN, lw=1.2)
-        axes[1].axhline(1.0, color=GOLD, ls="--", lw=0.9, alpha=0.8)
-        axes[1].axhline(0.0, color=MUTED, ls="-",  lw=0.5, alpha=0.4)
-        axes[1].fill_between(d, rsort, 0, where=rsort>0, color=GREEN, alpha=0.15)
-        axes[1].fill_between(d, rsort, 0, where=rsort<0, color=RED,   alpha=0.15)
-        _setup_ax(axes[1], ylabel="Sortino")
-
-        # Volatility
-        rvol = ret.rolling(W).std() * np.sqrt(TRADING_DAYS) * 100
-        axes[2].plot(d, rvol, color=ORANGE, lw=1.2)
-        axes[2].fill_between(d, rvol, rvol.mean(), color=ORANGE, alpha=0.12)
-        axes[2].axhline(rvol.mean(), color=MUTED, ls="--", lw=0.8)
-        _setup_ax(axes[2], ylabel="Ann. Vol (%)")
-
-        # Win Rate
-        rwr = ret.rolling(W).apply(lambda x: (x > 0).mean()*100, raw=True)
-        axes[3].plot(d, rwr, color=PURPLE, lw=1.2)
-        axes[3].axhline(50, color=GOLD, ls="--", lw=0.9, alpha=0.8)
-        axes[3].fill_between(d, rwr, 50, where=rwr>50, color=GREEN, alpha=0.12)
-        axes[3].fill_between(d, rwr, 50, where=rwr<50, color=RED,   alpha=0.12)
-        _setup_ax(axes[3], ylabel="Win Rate (%)", xlabel="Date")
-
-        for ax in axes[:-1]:
-            plt.setp(ax.get_xticklabels(), visible=False)
-        plt.tight_layout(rect=[0,0,1,0.97], h_pad=0.3)
-        pdf.savefig(fig, facecolor=BG); plt.close(fig)
+        for ax,series,col,yl,ref in [
+            (axes[0],rsh,ACCENT,"Sharpe",1.0),(axes[1],rsort,GREEN,"Sortino",1.0),
+            (axes[2],rvol,ORANGE,"Ann. Vol (%)",rvol.mean()),(axes[3],rwr,PURPLE,"Win Rate (%)",50.0)]:
+            ax.plot(d,series,color=col,lw=1.2)
+            ax.axhline(ref,color=GOLD,ls="--",lw=0.9,alpha=0.75)
+            ax.axhline(0,color=MUTED,ls="-",lw=0.4,alpha=0.4)
+            if ref==50.0:
+                ax.fill_between(d,series,ref,where=series>ref,color=GREEN,alpha=0.12)
+                ax.fill_between(d,series,ref,where=series<ref,color=RED,alpha=0.12)
+            else:
+                ax.fill_between(d,series,0,where=series>0,color=col,alpha=0.12)
+                ax.fill_between(d,series,0,where=series<0,color=RED,alpha=0.12)
+            _ax(ax,yl=yl)
+        _ax(axes[3],xl="Date")
+        for ax in axes[:-1]: plt.setp(ax.get_xticklabels(),visible=False)
+        plt.tight_layout(rect=[0,0,1,0.97],h_pad=0.3); plt.show()
         print("[PLOT 5] Rolling Metrics ✓")
-    except Exception as e: print(f"[WARNING] Plot 5 failed: {e}")
+    except Exception as e: print(f"[WARNING] Plot 5: {e}")
 
 
-# ─── Plot 6: Heatmaps ────────────────────────────────────────────────────────
-def plot6_heatmaps(result: pd.DataFrame, pdf: PdfPages) -> None:
-    """Monthly returns heatmap + day-of-week bar chart."""
+def plot6_heatmaps(r):
     try:
-        fig = plt.figure(figsize=(15, 8), facecolor=BG)
-        fig.suptitle("SEASONALITY ANALYSIS  ·  Monthly Returns & Day-of-Week Effect",
-                     color=TEXT, fontsize=13, fontweight="bold", y=0.99)
-        gs   = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[3, 1.2], wspace=0.3)
-        ax1  = fig.add_subplot(gs[0])
-        ax2  = fig.add_subplot(gs[1])
+        fig=plt.figure(figsize=(16,8),facecolor=BG)
+        fig.suptitle("SEASONALITY  |  Monthly Returns & Day-of-Week Effect",
+                     color=TEXT,fontsize=13,fontweight="bold",y=0.99)
+        gs=gridspec.GridSpec(1,2,figure=fig,width_ratios=[3,1.2],wspace=0.3)
+        ax1=fig.add_subplot(gs[0]); ax2=fig.add_subplot(gs[1])
         ax1.set_facecolor(PANEL_BG); ax2.set_facecolor(PANEL_BG)
-
-        ret = result["strategy_returns"].copy()
-        ret.index = pd.to_datetime(ret.index)
-
-        monthly = ret.resample("ME").apply(lambda x: (1+x).prod()-1)*100
-        piv = pd.DataFrame({
-            "year": monthly.index.year,
-            "month": monthly.index.month,
-            "ret": monthly.values,
-        }).pivot(index="year", columns="month", values="ret")
-        month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-        piv.columns = [month_names[c-1] for c in piv.columns]
-
-        cmap = sns.diverging_palette(10, 133, as_cmap=True)
-        sns.heatmap(piv, ax=ax1, cmap=cmap, center=0, annot=True, fmt=".1f",
-                    linewidths=0.4, linecolor=BORDER,
-                    annot_kws={"size": 7, "color": TEXT},
-                    cbar_kws={"shrink": 0.8, "label": "Return (%)"},
-                    robust=True)
-        ax1.set_title("Monthly Returns (%)", color=GOLD, fontsize=10, fontweight="bold", pad=8)
-        ax1.tick_params(colors=TEXT, labelsize=8)
-        ax1.set_xlabel("Month", color=MUTED, fontsize=8)
-        ax1.set_ylabel("Year", color=MUTED, fontsize=8)
-        ax1.collections[0].colorbar.ax.yaxis.label.set_color(TEXT)
+        ret=r["strategy_returns"].copy(); ret.index=pd.to_datetime(ret.index)
+        mo=ret.resample("ME").apply(lambda x:(1+x).prod()-1)*100
+        piv=pd.DataFrame({"y":mo.index.year,"m":mo.index.month,"v":mo.values})\
+              .pivot(index="y",columns="m",values="v")
+        mn=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+        piv.columns=[mn[c-1] for c in piv.columns]
+        cmap=sns.diverging_palette(10,133,as_cmap=True)
+        sns.heatmap(piv,ax=ax1,cmap=cmap,center=0,annot=True,fmt=".1f",
+                    linewidths=0.4,linecolor=BORDER,annot_kws={"size":7,"color":TEXT},
+                    cbar_kws={"shrink":0.8},robust=True)
+        ax1.set_title("Monthly Returns (%)",color=GOLD,fontsize=10,fontweight="bold",pad=8)
+        ax1.tick_params(colors=TEXT,labelsize=8)
+        ax1.set_xlabel("Month",color=MUTED,fontsize=8); ax1.set_ylabel("Year",color=MUTED,fontsize=8)
         ax1.collections[0].colorbar.ax.tick_params(colors=TEXT)
-
-        dow_order = ["Monday","Tuesday","Wednesday","Thursday","Friday"]
-        ret_dow = ret.to_frame("ret")
-        ret_dow["dow"] = ret_dow.index.day_name()
-        avg_dow = ret_dow.groupby("dow")["ret"].mean()*100
-        avg_dow = avg_dow.reindex(dow_order).fillna(0)
-        cols_bar = [GREEN if v >= 0 else RED for v in avg_dow.values]
-        bars = ax2.barh(avg_dow.index, avg_dow.values, color=cols_bar, alpha=0.85, height=0.6)
-        ax2.axvline(0, color=MUTED, lw=0.8)
-        for bar, val in zip(bars, avg_dow.values):
-            ax2.text(val + (0.001 if val >= 0 else -0.001),
-                     bar.get_y() + bar.get_height()/2,
-                     f"{val:.3f}%", va="center",
-                     ha="left" if val >= 0 else "right",
-                     color=TEXT, fontsize=8)
-        ax2.set_title("Avg Return by\nDay of Week (%)", color=GOLD, fontsize=10,
-                      fontweight="bold", pad=8)
-        _setup_ax(ax2, xlabel="Avg Return (%)")
-        ax2.invert_yaxis()
-
-        plt.tight_layout(rect=[0,0,1,0.96])
-        pdf.savefig(fig, facecolor=BG); plt.close(fig)
-        print("[PLOT 6] Heatmaps ✓")
-    except Exception as e: print(f"[WARNING] Plot 6 failed: {e}")
+        dorder=["Monday","Tuesday","Wednesday","Thursday","Friday"]
+        rd=ret.to_frame("r"); rd["dow"]=rd.index.day_name()
+        avg=rd.groupby("dow")["r"].mean()*100; avg=avg.reindex(dorder).fillna(0)
+        bars=ax2.barh(avg.index,avg.values,color=[GREEN if v>=0 else RED for v in avg.values],alpha=0.85,height=0.6)
+        ax2.axvline(0,color=MUTED,lw=0.8)
+        for bar,val in zip(bars,avg.values):
+            ax2.text(val+(0.0003 if val>=0 else -0.0003),bar.get_y()+bar.get_height()/2,
+                     f"{val:.3f}%",va="center",ha="left" if val>=0 else "right",color=TEXT,fontsize=8)
+        ax2.set_title("Avg Return by\nDay of Week",color=GOLD,fontsize=10,fontweight="bold",pad=8)
+        _ax(ax2,xl="Avg Return (%)"); ax2.invert_yaxis(); ax2.tick_params(colors=TEXT,labelsize=8)
+        plt.tight_layout(rect=[0,0,1,0.96]); plt.show(); print("[PLOT 6] Heatmaps ✓")
+    except Exception as e: print(f"[WARNING] Plot 6: {e}")
 
 
-# ─── Plot 7: Risk-Return Scatter ─────────────────────────────────────────────
-def plot7_risk_return(result: pd.DataFrame, pdf: PdfPages) -> None:
-    """Rolling 252d risk-return scatter with iso-Sharpe lines and time gradient."""
+def plot7_risk_return(r):
     try:
-        fig, ax = _new_fig(figsize=(12, 8),
-                           title="RISK-RETURN LANDSCAPE  ·  Rolling 252-Day Windows")
-        _setup_ax(ax, xlabel="Annualized Volatility (%)", ylabel="Annualized Return (%)")
-
-        W = TRADING_DAYS
-        for col, label, marker, sz in [
-            ("strategy_returns",  "Strategy",  "o", 20),
-            ("benchmark_returns", "Benchmark", "s", 20),
-        ]:
-            rv = result[col].rolling(W).std()  * np.sqrt(W) * 100
-            rr = result[col].rolling(W).mean() * W * 100
-            mask = rv.notna() & rr.notna()
-            vols = rv[mask].values; rets = rr[mask].values; n = len(vols)
-            if n == 0: continue
-            cmap = plt.get_cmap("plasma" if col=="strategy_returns" else "viridis")
-            sc = ax.scatter(vols, rets, c=np.arange(n), cmap=cmap, s=sz,
-                            marker=marker, alpha=0.5, zorder=3)
-            # Mark avg
-            ax.scatter(vols.mean(), rets.mean(), color=GOLD if col=="strategy_returns" else ORANGE,
-                       s=200, marker="D" if col=="strategy_returns" else "*",
-                       zorder=5, label=f"{label} (mean)", edgecolors="white", linewidths=0.8)
-
-        # Iso-Sharpe lines
-        all_vols = result["strategy_returns"].rolling(W).std().dropna() * np.sqrt(W) * 100
-        vr = np.linspace(max(all_vols.min()-2, 1), all_vols.max()+5, 100)
-        for sh, ls, lw in [(0.5,":",0.9),(1.0,"--",1.0),(1.5,"-.",0.9)]:
-            rl = RISK_FREE*100 + sh * vr
-            ax.plot(vr, rl, color=CYAN, lw=lw, ls=ls, alpha=0.5, label=f"Sharpe={sh}")
-
-        ax.axhline(RISK_FREE*100, color=MUTED, ls="--", lw=0.7, alpha=0.5,
-                   label=f"Risk-Free ({RISK_FREE*100:.1f}%)")
-        ax.legend(framealpha=0.15, facecolor=PANEL_BG, edgecolor=BORDER,
-                  labelcolor=TEXT, fontsize=8)
-        plt.tight_layout()
-        pdf.savefig(fig, facecolor=BG); plt.close(fig)
-        print("[PLOT 7] Risk-Return Scatter ✓")
-    except Exception as e: print(f"[WARNING] Plot 7 failed: {e}")
+        fig,ax=plt.subplots(figsize=(12,8),facecolor=BG); ax.set_facecolor(PANEL_BG)
+        W=TRADING_DAYS
+        for col,lbl,marker,cm in [("strategy_returns","Strategy","o","plasma"),
+                                    ("benchmark_returns","Benchmark","s","viridis")]:
+            rv=r[col].rolling(W).std()*np.sqrt(W)*100
+            rr=r[col].rolling(W).mean()*W*100
+            mask=rv.notna()&rr.notna()
+            vols=rv[mask].values; rets=rr[mask].values; n=len(vols)
+            if n==0: continue
+            ax.scatter(vols,rets,c=np.arange(n),cmap=cm,s=18,marker=marker,alpha=0.5,zorder=3)
+            ax.scatter(vols.mean(),rets.mean(),
+                       color=GOLD if "strategy" in col else ORANGE,
+                       s=220,marker="D" if "strategy" in col else "*",zorder=5,
+                       label=f"{lbl} (mean)",edgecolors="white",linewidths=0.8)
+        all_v=r["strategy_returns"].rolling(W).std().dropna()*np.sqrt(W)*100
+        vr=np.linspace(max(all_v.min()-2,1),all_v.max()+5,100)
+        for sh,ls,al in [(0.5,":",0.55),(1.0,"--",0.65),(1.5,"-.",0.55)]:
+            ax.plot(vr,RISK_FREE*100+sh*vr,color=CYAN,lw=0.9,ls=ls,alpha=al,label=f"Sharpe={sh}")
+        ax.axhline(RISK_FREE*100,color=MUTED,ls="--",lw=0.7,alpha=0.5,
+                   label=f"Risk-free ({RISK_FREE*100:.1f}%)")
+        _ax(ax,"RISK-RETURN LANDSCAPE  |  Rolling 252-Day Windows",
+            "Annualized Volatility (%)","Annualized Return (%)")
+        ax.legend(framealpha=0.15,facecolor=PANEL_BG,edgecolor=BORDER,labelcolor=TEXT,fontsize=8)
+        plt.tight_layout(); plt.show(); print("[PLOT 7] Risk-Return ✓")
+    except Exception as e: print(f"[WARNING] Plot 7: {e}")
 
 
-# ─── Plot 8: Monte Carlo ─────────────────────────────────────────────────────
-def plot8_monte_carlo(result: pd.DataFrame, pdf: PdfPages) -> None:
-    """Bootstrap Monte Carlo with percentile paths and final-value histogram."""
+def plot8_monte_carlo(r):
     try:
-        N_SIM = 1000
-        ret   = result["strategy_returns"].dropna().values
-        n     = len(ret)
-        sims  = np.zeros((N_SIM, n))
-        for i in range(N_SIM):
-            samp    = np.random.choice(ret, size=n, replace=True)
-            sims[i] = INITIAL_CAPITAL * np.cumprod(1 + samp)
-
-        fig = plt.figure(figsize=(15, 8), facecolor=BG)
-        fig.suptitle("MONTE CARLO SIMULATION  ·  1000 Bootstrap Paths",
-                     color=TEXT, fontsize=13, fontweight="bold", y=0.99)
-        gs  = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[3, 1.5], wspace=0.25)
-        ax1 = fig.add_subplot(gs[0]); ax2 = fig.add_subplot(gs[1])
+        N=1000; ret=r["strategy_returns"].dropna().values; n=len(ret)
+        sims=np.zeros((N,n))
+        for i in range(N): sims[i]=INITIAL_CAPITAL*np.cumprod(1+np.random.choice(ret,n,replace=True))
+        fig=plt.figure(figsize=(15,8),facecolor=BG)
+        fig.suptitle("MONTE CARLO SIMULATION  |  1000 Bootstrap Paths",
+                     color=TEXT,fontsize=13,fontweight="bold",y=0.99)
+        gs=gridspec.GridSpec(1,2,figure=fig,width_ratios=[3,1.5],wspace=0.25)
+        ax1=fig.add_subplot(gs[0]); ax2=fig.add_subplot(gs[1])
         ax1.set_facecolor(PANEL_BG); ax2.set_facecolor(PANEL_BG)
-
-        days = np.arange(n)
-        # All paths (very transparent)
-        for i in range(N_SIM):
-            ax1.plot(days, sims[i]/1e5, color=ACCENT, alpha=0.025, lw=0.3)
-
-        pcts   = [5, 25, 50, 75, 95]
-        labels = ["P5","P25","P50","P75","P95"]
-        pcolors= [RED, ORANGE, "white", GREEN, CYAN]
-        for pct, lbl, col in zip(pcts, labels, pcolors):
-            path = np.percentile(sims, pct, axis=0)
-            ax1.plot(days, path/1e5, color=col, lw=2.0, label=f"{lbl}: ₹{path[-1]/1e5:.1f}L")
-
-        actual = result["portfolio_value"].values
-        ax1.plot(days, actual/1e5, color=GOLD, lw=2.5, ls="--", zorder=5,
-                 label=f"Actual: ₹{actual[-1]/1e5:.1f}L")
-        _setup_ax(ax1, ylabel="Portfolio Value (₹ Lakhs)", xlabel="Trading Days")
-        ax1.legend(framealpha=0.15, facecolor=PANEL_BG, edgecolor=BORDER,
-                   labelcolor=TEXT, fontsize=8)
-
-        finals = sims[:, -1] / 1e5
-        ax2.hist(finals, bins=50, color=ACCENT, alpha=0.6, orientation="horizontal",
-                 edgecolor="none")
-        for pct, lbl, col in zip(pcts, labels, pcolors):
-            val = np.percentile(finals, pct)
-            ax2.axhline(val, color=col, lw=1.5, ls="--", label=f"{lbl}: ₹{val:.1f}L")
-        ax2.axhline(actual[-1]/1e5, color=GOLD, lw=2.0, label=f"Actual: ₹{actual[-1]/1e5:.1f}L")
-        _setup_ax(ax2, ylabel="Final Value (₹ Lakhs)", xlabel="Count")
-        ax2.legend(framealpha=0.15, facecolor=PANEL_BG, edgecolor=BORDER,
-                   labelcolor=TEXT, fontsize=7.5)
-
-        print(f"\n[MC] P5  Final : ₹{np.percentile(sims[:,-1],5):>12,.0f}")
-        print(f"[MC] P50 Final : ₹{np.percentile(sims[:,-1],50):>12,.0f}")
-        print(f"[MC] P95 Final : ₹{np.percentile(sims[:,-1],95):>12,.0f}")
-
-        plt.tight_layout(rect=[0,0,1,0.97])
-        pdf.savefig(fig, facecolor=BG); plt.close(fig)
-        print("[PLOT 8] Monte Carlo ✓")
-    except Exception as e: print(f"[WARNING] Plot 8 failed: {e}")
+        days=np.arange(n)
+        for i in range(N): ax1.plot(days,sims[i]/1e5,color=ACCENT,alpha=0.025,lw=0.3)
+        pcts=[5,25,50,75,95]; pcols=[RED,ORANGE,"white",GREEN,CYAN]
+        for pct,col in zip(pcts,pcols):
+            path=np.percentile(sims,pct,axis=0)
+            ax1.plot(days,path/1e5,color=col,lw=2,label=f"P{pct}: {path[-1]/1e5:.1f}L")
+        actual=r["portfolio_value"].values
+        ax1.plot(days,actual/1e5,color=GOLD,lw=2.5,ls="--",zorder=5,
+                 label=f"Actual: {actual[-1]/1e5:.1f}L")
+        _ax(ax1,yl="Portfolio (Rs Lakhs)",xl="Trading Days")
+        ax1.legend(framealpha=0.15,facecolor=PANEL_BG,edgecolor=BORDER,labelcolor=TEXT,fontsize=8)
+        finals=sims[:,-1]/1e5
+        ax2.hist(finals,bins=50,color=ACCENT,alpha=0.6,orientation="horizontal",edgecolor="none")
+        for pct,col in zip(pcts,pcols):
+            val=np.percentile(finals,pct)
+            ax2.axhline(val,color=col,lw=1.5,ls="--",label=f"P{pct}: {val:.1f}L")
+        ax2.axhline(actual[-1]/1e5,color=GOLD,lw=2.0,label=f"Actual: {actual[-1]/1e5:.1f}L")
+        _ax(ax2,yl="Final Value (Rs Lakhs)",xl="Count")
+        ax2.legend(framealpha=0.15,facecolor=PANEL_BG,edgecolor=BORDER,labelcolor=TEXT,fontsize=7.5)
+        print(f"\n[MC] P5 : Rs{np.percentile(sims[:,-1],5):>12,.0f}")
+        print(f"[MC] P50: Rs{np.percentile(sims[:,-1],50):>12,.0f}")
+        print(f"[MC] P95: Rs{np.percentile(sims[:,-1],95):>12,.0f}")
+        plt.tight_layout(rect=[0,0,1,0.97]); plt.show(); print("[PLOT 8] Monte Carlo ✓")
+    except Exception as e: print(f"[WARNING] Plot 8: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 8: SAVE OUTPUTS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-def save_outputs(result: pd.DataFrame, trades: pd.DataFrame) -> None:
-    """Persist trades log and equity curve as CSV files."""
-    try:
-        trades.to_csv(TRADES_CSV, index=False)
-        print(f"[OUTPUT] {TRADES_CSV} saved ({len(trades)} rows)")
-    except Exception as e:
-        print(f"[WARNING] Could not save trades CSV: {e}")
-    try:
-        dd = drawdown_series(result["portfolio_value"].values)
-        rs = result["strategy_returns"].rolling(TRADING_DAYS).apply(
-            lambda x: (x.mean()-RISK_FREE/TRADING_DAYS)/(x.std()+1e-9)*np.sqrt(TRADING_DAYS), raw=True)
-        eq = pd.DataFrame({
-            "date"           : result.index,
-            "portfolio_value": result["portfolio_value"].values,
-            "benchmark_value": result["benchmark_value"].values,
-            "drawdown_pct"   : dd * 100,
-            "rolling_sharpe" : rs.values,
-            "strategy_ret"   : result["strategy_returns"].values,
-            "benchmark_ret"  : result["benchmark_returns"].values,
-        })
-        eq.to_csv(EQUITY_CSV, index=False)
-        print(f"[OUTPUT] {EQUITY_CSV} saved ({len(eq)} rows)")
-    except Exception as e:
-        print(f"[WARNING] Could not save equity CSV: {e}")
+def main():
+    print("\n"+"="*66)
+    print("  NIFTY 50 QUANT SYSTEM v3.0  |  UNiverse Capital")
+    print("="*66+"\n")
+
+    df      = download_data()
+    feat    = compute_features(df)
+    print(f"[PIPELINE] Features: {feat.shape}")
+
+    sig     = generate_signals(feat)
+    sc      = sig["signal"].value_counts()
+    print(f"[PIPELINE] Signals -> Long:{sc.get(1.0,0)}  Short:{sc.get(-1.0,0)}  Flat:{sc.get(0.0,0)}\n")
+
+    result,trades = run_backtest(sig)
+    nl = (trades["signal"]==1).sum()  if len(trades)>0 else 0
+    ns = (trades["signal"]==-1).sum() if len(trades)>0 else 0
+    
+    print(f"[PIPELINE] Trades: {len(trades)} ({nl} long, {ns} short)")
+    if len(trades)>0: print(f"[PIPELINE] Avg hold: {trades['holding_days'].mean():.1f} days")
+    
+    metrics = compute_metrics(result,trades)
+
+    # --- PRINT CONSOLE METRICS TEXT SUMMARY ---
+    init_cap = INITIAL_CAPITAL
+    fin_cap = result['portfolio_value'].iloc[-1]
+    ben_cap = result['benchmark_value'].iloc[-1]
+    
+    print("\n" + "="*66)
+    print("  PERFORMANCE METRICS SUMMARY")
+    print("="*66)
+    print(f"Initial Capital      : Rs {init_cap:>12,.0f}")
+    print(f"Final Capital (Strat): Rs {fin_cap:>12,.0f}")
+    print(f"Final Capital (Bench): Rs {ben_cap:>12,.0f}")
+    print("-" * 66)
+    print(f"{'METRIC':<22} | {'STRATEGY':>15} | {'BENCHMARK':>15}")
+    print("-" * 66)
+    
+    s = metrics["strategy"]
+    b = metrics["benchmark"]
+    t = metrics["trades"]
+    
+    def pr(name, s_val, b_val, is_pct=False, is_int=False):
+        if is_int:
+            sv = f"{int(s_val)}"
+            bv = f"{int(b_val)}" if b_val is not None else "-"
+        else:
+            sv = f"{s_val:+.2f}%" if is_pct else f"{s_val:.4f}"
+            if b_val is not None:
+                bv = f"{b_val:+.2f}%" if is_pct else f"{b_val:.4f}"
+            else:
+                bv = "-"
+        print(f"{name:<22} | {sv:>15} | {bv:>15}")
+
+    pr("Total Return", s["total_return"], b["total_return"], is_pct=True)
+    pr("CAGR", s["cagr"], b["cagr"], is_pct=True)
+    pr("Ann. Volatility", s["ann_vol"], b["ann_vol"], is_pct=True)
+    pr("Max Drawdown", s["max_dd"], b["max_dd"], is_pct=True)
+    pr("Sharpe Ratio", s["sharpe"], b["sharpe"])
+    pr("Sortino Ratio", s["sortino"], b["sortino"])
+    pr("Calmar Ratio", s["calmar"], b["calmar"])
+    pr("Omega Ratio", s["omega"], b["omega"])
+    pr("Info Ratio", s["info_ratio"], None)
+    print("-" * 66)
+    pr("Total Trades", t["n_trades"], None, is_int=True)
+    pr("Win Rate", t["win_rate"], None, is_pct=True)
+    pr("Profit Factor", t["profit_factor"], None)
+    pr("Expectancy/Trade", t["expectancy"], None, is_pct=True)
+    pr("Avg Hold (Days)", t["avg_hold"], None)
+    print("="*66 + "\n")
+    # -------------------------------------------
+
+    print("[PIPELINE] Rendering all plots ...")
+    plot_metrics_dashboard(metrics)
+    plot1_equity_curve(result)
+    plot2_drawdown(result)
+    plot3_dist(result)
+    plot4_trades(trades)
+    plot5_rolling(result,trades)
+    plot6_heatmaps(result)
+    plot7_risk_return(result)
+    plot8_monte_carlo(result)
+
+    print("\n"+"="*66)
+    print("  PIPELINE COMPLETE")
+    print("="*66+"\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    """Execute the full Nifty 50 quantitative trading pipeline end-to-end."""
-    print("\n" + "═"*66)
-    print("  NIFTY 50 QUANT SYSTEM v2.0  ·  Initializing Pipeline")
-    print("═"*66 + "\n")
-
-    df       = download_data()
-    features = compute_features(df)
-    print(f"[PIPELINE] Features computed: {features.shape}")
-
-    signals  = generate_signals(features)
-    sc       = signals["signal"].value_counts()
-    print(f"[PIPELINE] Signal counts → Long:{sc.get(1.0,0)}  "
-          f"Short:{sc.get(-1.0,0)}  Flat:{sc.get(0.0,0)}\n")
-
-    result, trades = run_backtest(signals)
-    print(f"[PIPELINE] Trades executed  : {len(trades)}")
-    if len(trades) > 0:
-        print(f"[PIPELINE] Avg hold (days)  : {trades['holding_days'].mean():.2f}")
-    print(f"[PIPELINE] Final portfolio  : ₹{result['portfolio_value'].iloc[-1]:>12,.0f}")
-    print(f"[PIPELINE] Final benchmark  : ₹{result['benchmark_value'].iloc[-1]:>12,.0f}\n")
-
-    metrics = compute_metrics(result, trades)
-    print_metrics(metrics)
-
-    print("[PIPELINE] Generating 8-plot PDF report ...")
-    with PdfPages(PDF_FILE) as pdf:
-        # PDF metadata
-        d = pdf.infodict()
-        d["Title"]   = "Nifty 50 Quant System v2.0 — Performance Report"
-        d["Author"]  = "UNiverse Capital"
-        d["Subject"] = "Quantitative Trading Analysis"
-        plot1_equity_curve(result, pdf)
-        plot2_drawdown(result, pdf)
-        plot3_returns_dist(result, pdf)
-        plot4_trade_pnl(trades, pdf)
-        plot5_rolling(result, pdf)
-        plot6_heatmaps(result, pdf)
-        plot7_risk_return(result, pdf)
-        plot8_monte_carlo(result, pdf)
-    print(f"[OUTPUT] PDF saved → {PDF_FILE}")
-
-    save_outputs(result, trades)
-
-    print("\n" + "═"*66)
-    print("  PIPELINE COMPLETE ✓")
-    print("═"*66 + "\n")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
+
+improvement  = """
+
+    tarine 8 yers of data then back test on 2 yeard unseen data 
+    
+"""
