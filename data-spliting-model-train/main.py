@@ -1,17 +1,3 @@
-"""
-Nifty 50 Quant System v6.0 — UNiverse Capital
-==============================================
-Key fixes over v5:
-  - Composite SCORE approach (weighted sum) replaces AND-gate
-    → 5 conditions AND-gated was blocking 93% of days
-  - Always tries to be long when trend is positive (high market exposure)
-  - Shorts only in confirmed crash regime (very rare)
-  - Trailing stop + time exit preserved
-  - Metrics table includes Initial Capital, Final Capital, Net P&L
-  - Walk-forward: 8yr train calibrate → 2yr pure OOS
-Run: python model.py
-"""
-
 import warnings; warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
