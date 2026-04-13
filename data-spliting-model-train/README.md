@@ -20,3 +20,10 @@ Trend + Low Volatility
 Trend + High Volatility
 Range + Low Volatility
 Range + High Volatility
+
+
+-------------------------------------------------------
+
+test 2 : nodel overfiting 
+
+-------------------------------------------------------
