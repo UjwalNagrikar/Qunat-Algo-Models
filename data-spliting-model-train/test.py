@@ -19,13 +19,13 @@ TICKER          = "^NSEI"
 INITIAL_CAPITAL = 1_000_000
 TC              = 0.0005
 SLIPPAGE        = 0.0002
-RISK_FREE       = 0.065
+RISK_FREE       = 0.065      #   
 TRADING_DAYS    = 252
 TRAIN_YEARS     = 8
-KELLY_CAP       = 3.5          # AGGRESSIVE: Larger positions
-MIN_HOLD        = 2            # AGGRESSIVE: Exit sooner
-MAX_HOLD        = 15           # AGGRESSIVE: Higher turnover
-TRAIL_STOP      = 0.035        # AGGRESSIVE: 3.5% tighter stops
+KELLY_CAP       = 2.0
+MIN_HOLD        = 4
+MAX_HOLD        = 25
+TRAIL_STOP      = 0.05      # 7% trailing stop
 
 BG="#0D1117"; PANEL_BG="#161B22"; BORDER="#30363D"; TEXT="#E6EDF3"
 MUTED="#8B949E"; ACCENT="#58A6FF"; GREEN="#3FB950"; RED="#F85149"
@@ -161,37 +161,36 @@ def _long_score(f: pd.DataFrame) -> pd.Series:
     """
     sc = pd.Series(0.0, index=f.index)
 
-    # Momentum contributions (AGGRESSIVE — higher weights)
-    sc += np.clip(f["ret_20d"] / 0.015, -5, 5) * 3.5   # 20d — primary (was 2.5)
-    sc += np.clip(f["ret_60d"] / 0.04, -4, 4) * 2.0    # 60d — regime (was 1.5)
-    sc += np.clip(f["ret_10d"] / 0.008, -4, 4) * 1.5   # 10d — recent (was 1.0)
-    sc += np.clip(f["ret_40d"] / 0.025, -2, 2) * 1.2   # 40d — medium (was 0.8)
-    sc += np.clip(f["ret_5d"]  / 0.006, -3, 3) * 1.0   # 5d — short pulse (was 0.5)
-    sc += np.clip(f["accel20"] / 0.008, -3, 3) * 1.2   # acceleration (was 0.7)
+    # Momentum contributions (clipped to prevent single outlier dominating)
+    sc += np.clip(f["ret_20d"] / 0.02, -4, 4) * 2.5   # 20d — primary
+    sc += np.clip(f["ret_60d"] / 0.05, -3, 3) * 1.5   # 60d — regime
+    sc += np.clip(f["ret_10d"] / 0.01, -3, 3) * 1.0   # 10d — recent
+    sc += np.clip(f["ret_40d"] / 0.03, -2, 2) * 0.8   # 40d — medium
+    sc += np.clip(f["ret_5d"]  / 0.008,-2, 2) * 0.5   # 5d  — short pulse
+    sc += np.clip(f["accel20"] / 0.01, -2, 2) * 0.7   # acceleration
 
-    # Breadth (AGGRESSIVE — higher multipliers)
-    sc += (f["upfrac_10"] - 0.5) * 4.0   # was 3.0
-    sc += (f["upfrac_20"] - 0.5) * 2.5   # was 2.0
-    sc += (f["range60"]   - 0.5) * 2.0   # was 1.5
+    # Breadth
+    sc += (f["upfrac_10"] - 0.5) * 3.0   # ranges ~[-1.5, +1.5]
+    sc += (f["upfrac_20"] - 0.5) * 2.0
+    sc += (f["range60"]   - 0.5) * 1.5   # price position in 60d range
 
-    # Candle (AGGRESSIVE — lower thresholds)
-    sc += np.where(f["body_ratio"] > 0.5, np.sign(f["daily_ret"]) * 0.6, 0.0)  # was 0.6, 0.4
-    sc += np.where(f["vol_z"] > 1.0, np.sign(f["daily_ret"]) * 0.8, 0.0)       # was 1.5, 0.5
+    # Candle
+    sc += np.where(f["body_ratio"] > 0.6, np.sign(f["daily_ret"]) * 0.4, 0.0)
+    sc += np.where(f["vol_z"] > 1.5, np.sign(f["daily_ret"]) * 0.5, 0.0)
 
     return sc
 
 
 def _short_score(f: pd.DataFrame) -> pd.Series:
-    """Composite short score — AGGRESSIVE version with higher conviction"""
+    """Composite short score — inverse of long score with tighter weights."""
     sc = pd.Series(0.0, index=f.index)
-    sc += np.clip(-f["ret_20d"] / 0.015, -5, 5) * 3.5   # Higher weight
-    sc += np.clip(-f["ret_60d"] / 0.04, -4, 4) * 2.0    # Higher weight
-    sc += np.clip(-f["ret_10d"] / 0.008, -4, 4) * 1.5   # Higher weight
-    sc += (0.5 - f["upfrac_10"]) * 4.0  # was 3.0
-    sc += (0.5 - f["upfrac_20"]) * 2.5  # was 2.0
-    sc += (0.5 - f["range60"])   * 2.0  # was 1.5
-    sc += np.where(f["hurst"] > 0.52, 1.0, 0.0)  # Trigger shorts in mild trends (was 0.55, 0.5)
-    sc += np.where(f["vol_z"] < -1.0, 0.8, 0.0)  # Add volume confirmation
+    sc += np.clip(-f["ret_20d"] / 0.02, -4, 4) * 2.5
+    sc += np.clip(-f["ret_60d"] / 0.05, -3, 3) * 1.5
+    sc += np.clip(-f["ret_10d"] / 0.01, -3, 3) * 1.0
+    sc += (0.5 - f["upfrac_10"]) * 3.0
+    sc += (0.5 - f["upfrac_20"]) * 2.0
+    sc += (0.5 - f["range60"])   * 1.5
+    sc += np.where(f["hurst"] > 0.55, 0.5, 0.0)  # only short in trending down
     return sc
 
 
@@ -215,27 +214,27 @@ def calibrate(train: pd.DataFrame) -> dict:
     # 5-day forward return for threshold search
     fwd5 = train["log_ret"].shift(-1).rolling(5).sum().shift(-4)
 
-    # Long threshold: AGGRESSIVE — more frequent long trades
-    # Target: 30-80% exposure
-    best_tl = 1.5; best_sh = -np.inf
-    for thr in np.arange(0.3, 6.0, 0.2):
+    # Long threshold: find score level where 5d forward Sharpe is maximised
+    # Target: ~40-60% of trading days should have a long signal
+    best_tl = 2.0; best_sh = -np.inf
+    for thr in np.arange(0.5, 8.0, 0.25):
         mask = ls >= thr
         pct  = mask.mean()
-        if pct < 0.30 or pct > 0.80: continue   # AGGRESSIVE: 30-80% exposure
+        if pct < 0.15 or pct > 0.70: continue   # keep 15-70% market exposure
         fr = fwd5[mask].dropna()
-        if len(fr) < 30: continue               # Lower sample threshold
+        if len(fr) < 50: continue
         sh = fr.mean() / (fr.std() + 1e-9) * np.sqrt(252/5)
         if sh > best_sh: best_sh = sh; best_tl = thr
 
-    # Short threshold: AGGRESSIVE — more frequent shorts
-    # Target: up to 15% exposure
-    best_ts = 3.5; best_sh_s = -np.inf
-    for thr in np.arange(1.5, 8.0, 0.3):
+    # Short threshold: very high bar — only crash regime
+    # Target: <5% of days
+    best_ts = 6.0; best_sh_s = -np.inf
+    for thr in np.arange(3.0, 10.0, 0.5):
         mask = ss >= thr
         pct  = mask.mean()
-        if pct < 0.01 or pct > 0.15: continue  # AGGRESSIVE: up to 15% shorts
+        if pct < 0.005 or pct > 0.08: continue
         fr = (-fwd5[mask]).dropna()
-        if len(fr) < 5: continue                # Very low sample threshold
+        if len(fr) < 10: continue
         sh = fr.mean() / (fr.std() + 1e-9) * np.sqrt(252/5)
         if sh > best_sh_s: best_sh_s = sh; best_ts = thr
 
@@ -279,16 +278,15 @@ def generate_signals(f: pd.DataFrame, params: dict) -> pd.DataFrame:
 
     raw = np.where(long_sig, 1.0, np.where(short_sig, -1.0, 0.0))
 
-    # Size: AGGRESSIVE — higher conviction = much larger positions
+    # Size: stronger score → more conviction → larger size
     score_strength = np.where(raw == 1,  ls / (tl + 1e-9),
                      np.where(raw == -1, ss / (ts + 1e-9), 0.0))
-    score_strength = np.clip(score_strength, 0.7, 2.8)  # AGGRESSIVE: Wider (was 0.5-2.0)
+    score_strength = np.clip(score_strength, 0.5, 2.0)
 
-    rv_norm = (s["rvol20"] / (rvm + 1e-9)).clip(lower=0.15, upper=4.5)  # AGGRESSIVE: Extreme (was 0.3-3.0)
+    rv_norm = (s["rvol20"] / (rvm + 1e-9)).clip(lower=0.3, upper=3.0)
     base    = kf / rv_norm
     s["signal"]   = raw
-    # AGGRESSIVE: allow up to 3x+ leverage on high conviction signals
-    s["pos_size"] = (base * score_strength * np.abs(raw)).clip(upper=KELLY_CAP * 1.3)
+    s["pos_size"] = (base * score_strength * np.abs(raw)).clip(upper=KELLY_CAP)
     return s
 
 
@@ -964,86 +962,7 @@ def plot7_heatmaps(r_full):
     except Exception as e: print(f"[WARNING] Plot 7: {e}")
 
 
-def plot9_accuracy_curves(trades_train, trades_test):
-    """Plot accuracy curves: Training accuracy vs Test accuracy over trades."""
-    try:
-        fig, ax = plt.subplots(figsize=(14, 7), facecolor=BG)
-        ax.set_facecolor(PANEL_BG)
-        fig.suptitle("ACCURACY CURVES  |  Training vs Test — Win Rate Evolution",
-                     color=TEXT, fontsize=13, fontweight="bold")
-        
-        # Calculate rolling win rates (every 5 trades)
-        window = 5
-        
-        if len(trades_train) > window:
-            train_trades_df = pd.DataFrame(trades_train).sort_values("entry_date").reset_index(drop=True)
-            train_wins = (train_trades_df["pnl_pct"] > 0).astype(int)
-            train_accuracy = train_wins.rolling(window=window).mean() * 100
-            train_x = np.arange(len(train_accuracy)) / len(train_accuracy) * 100
-        else:
-            train_accuracy = pd.Series(dtype=float)
-            train_x = np.array([])
-        
-        if len(trades_test) > window:
-            test_trades_df = pd.DataFrame(trades_test).sort_values("entry_date").reset_index(drop=True)
-            test_wins = (test_trades_df["pnl_pct"] > 0).astype(int)
-            test_accuracy = test_wins.rolling(window=window).mean() * 100
-            test_x = np.arange(len(test_accuracy)) / len(test_accuracy) * 100
-        else:
-            test_accuracy = pd.Series(dtype=float)
-            test_x = np.array([])
-        
-        # Plot training accuracy
-        if len(train_accuracy) > 0:
-            ax.plot(train_x, train_accuracy.values, color=ACCENT, linewidth=2.5, 
-                   label=f"Training Accuracy (n={len(trades_train)} trades)", marker='o', markersize=3, alpha=0.8)
-            ax.fill_between(train_x, train_accuracy.values, alpha=0.15, color=ACCENT)
-        
-        # Plot test accuracy
-        if len(test_accuracy) > 0:
-            ax.plot(test_x, test_accuracy.values, color=GREEN, linewidth=2.5, 
-                   label=f"Validation Accuracy (n={len(trades_test)} trades)", marker='s', markersize=3.5, alpha=0.8)
-            ax.fill_between(test_x, test_accuracy.values, alpha=0.15, color=GREEN)
-        
-        # Reference lines
-        ax.axhline(50, color=GOLD, linestyle="--", linewidth=1.5, alpha=0.7, label="50% Baseline")
-        ax.axhline((trades_train.loc[pd.DataFrame(trades_train)["pnl_pct"] > 0, "pnl_pct"] if len(trades_train) > 0 else pd.Series()).count() / len(trades_train) * 100 if len(trades_train) > 0 else 0, 
-                   color=ACCENT, linestyle=":", linewidth=1.2, alpha=0.6, label=f"Train Avg: {(trades_train.loc[pd.DataFrame(trades_train)['pnl_pct'] > 0, 'pnl_pct'].count() / len(trades_train) * 100 if len(trades_train) > 0 else 0):.1f}%")
-        
-        _ax(ax, yl="Win Rate (%)", xl="Progress (%)")
-        ax.set_ylim([0, 100])
-        ax.set_xlim([0, 100])
-        ax.grid(True, alpha=0.2, linestyle="--")
-        ax.legend(framealpha=0.15, facecolor=PANEL_BG, edgecolor=BORDER, labelcolor=TEXT, fontsize=10, loc="lower right")
-        
-        # Add statistics box
-        if len(trades_train) > 0:
-            train_wr = (pd.DataFrame(trades_train)["pnl_pct"] > 0).mean() * 100
-        else:
-            train_wr = 0
-        
-        if len(trades_test) > 0:
-            test_wr = (pd.DataFrame(trades_test)["pnl_pct"] > 0).mean() * 100
-        else:
-            test_wr = 0
-        
-        info_text = (f"Training Accuracy: {train_wr:.2f}%\n"
-                    f"Test Accuracy: {test_wr:.2f}%\n"
-                    f"Accuracy Gap: {train_wr - test_wr:.2f}%\n"
-                    f"Generalization: {'Good' if abs(train_wr - test_wr) < 10 else 'Overfitting' if train_wr - test_wr > 10 else 'Underfitting'}")
-        
-        ax.text(0.02, 0.98, info_text, transform=ax.transAxes, color=TEXT, fontsize=9,
-               va="top", ha="left", fontfamily="monospace",
-               bbox=dict(boxstyle="round,pad=0.7", fc=PANEL_BG, ec=BORDER, alpha=0.9, linewidth=1.2))
-        
-        plt.tight_layout()
-        plt.show()
-        print("[PLOT 9] Accuracy Curves ✓")
-    except Exception as e:
-        print(f"[WARNING] Plot 9 (Accuracy Curves): {e}")
-
-
-
+def plot8_monte_carlo(r_test):
     try:
         N=1000; ret=r_test["strategy_returns"].dropna().values; n=len(ret)
         init=r_test["portfolio_value"].iloc[0]
@@ -1140,7 +1059,6 @@ def main():
     plot6_rolling(r_test)
     plot7_heatmaps(r_full)
     plot8_monte_carlo(r_test)
-    plot9_accuracy_curves(trades_train, trades_test)  # NEW: Accuracy Curves
 
     print("\n"+"="*68)
     print("  PIPELINE COMPLETE  |  v6.0 Walk-Forward OOS")
@@ -1149,4 +1067,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
