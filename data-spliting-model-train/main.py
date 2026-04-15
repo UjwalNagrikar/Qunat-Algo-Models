@@ -1043,7 +1043,7 @@ def plot9_accuracy_curves(trades_train, trades_test):
         print(f"[WARNING] Plot 9 (Accuracy Curves): {e}")
 
 
-
+def plot8_monte_carlo(r_test):
     try:
         N=1000; ret=r_test["strategy_returns"].dropna().values; n=len(ret)
         init=r_test["portfolio_value"].iloc[0]
